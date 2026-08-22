@@ -30,6 +30,11 @@ jobs:
           "ImageOS=$env:ImageOS"
           "ImageVersion=$env:ImageVersion"
 
+      - name: Prove lid.3 recipe before network
+        shell: pwsh
+        run: |
+          .\scripts\Test-RuntimeRecipe.ps1 -EvidencePath ".\artifacts\evidence-${{ matrix.backend }}\recipe-preflight.json"
+
       - name: Prove sanitizer before CUDA
         if: ${{ matrix.backend == 'cuda' }}
         shell: pwsh
@@ -41,8 +46,15 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\Build-Runtime.ps1 -Backend '${{ matrix.backend }}' -Configuration Release -CudaArch '75;80;86;89' -CudaVersion '12.8'
-          $zip = Get-ChildItem -LiteralPath .\artifacts -File -Filter '*.zip' | Select-Object -First 1
-          if (-not $zip) { throw 'Build produced no ZIP.' }
+          $zips = @(Get-ChildItem -LiteralPath .\artifacts -File -Filter '*.zip')
+          if ($zips.Count -ne 1) { throw "Build produced $($zips.Count) ZIPs; expected exactly one." }
+          $zip = $zips[0]
+          $expected = if ('${{ matrix.backend }}' -eq 'cpu') {
+            'nemo-speech-v0.1.0-diagnotes-lid.3-windows-x86_64-cpu.zip'
+          } else {
+            'nemo-speech-v0.1.0-diagnotes-lid.3-windows-x86_64-cuda-sm75-sm80-sm86-sm89.zip'
+          }
+          if ($zip.Name -ne $expected) { throw "Unexpected ZIP name: $($zip.Name)" }
           "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
           "zip_name=$($zip.Name)" >> $env:GITHUB_OUTPUT
           Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256

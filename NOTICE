@@ -12,3 +12,11 @@ transcript. No other functional source modification is authorized.
 The Nemotron speech model is not included. NVIDIA GPU drivers are not included.
 Third-party license texts and the machine-readable inventory are included in
 each runtime ZIP.
+
+Release lid.3 uses static vcpkg libraries with the dynamic Microsoft Visual C++
+Runtime. Required release x64 CRT DLLs are redistributed unmodified and
+app-local from the Redist directory of the effective Visual Studio 2022
+toolchain. Each ZIP includes the applicable Visual Studio license terms, the
+official REDIST list, and a per-DLL version, origin, signature, and SHA-256
+inventory. The Visual C++ Runtime informational license is not used as the
+redistribution grant.

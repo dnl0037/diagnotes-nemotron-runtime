@@ -10,6 +10,7 @@ jobs:
   build:
     name: build-${{ matrix.backend }}
     runs-on: windows-2022
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -52,14 +53,13 @@ jobs:
           subject-path: ${{ steps.build.outputs.zip_path }}
           show-summary: false
 
-      - name: Upload final ZIP and build evidence
+      - name: Upload sanitized build evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: runtime-${{ matrix.backend }}-${{ github.run_id }}
-          path: |
-            ${{ steps.build.outputs.zip_path }}
-            artifacts/evidence-${{ matrix.backend }}/**
-          if-no-files-found: error
+          name: build-evidence-${{ matrix.backend }}-${{ github.run_id }}
+          path: artifacts/evidence-${{ matrix.backend }}/**
+          if-no-files-found: warn
           retention-days: 7
           compression-level: 0
 
@@ -70,5 +70,15 @@ jobs:
           name: sanitizer-preflight-${{ matrix.backend }}-${{ github.run_id }}
           path: artifacts/sanitizer-preflight/sanitizer-preflight.json
           if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload final runtime ZIP
+        if: ${{ success() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: runtime-${{ matrix.backend }}-${{ github.run_id }}
+          path: ${{ steps.build.outputs.zip_path }}
+          if-no-files-found: error
           retention-days: 7
           compression-level: 0

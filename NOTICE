@@ -1,0 +1,14 @@
+DiagNotes Nemotron runtime recipe
+Copyright 2026 Daniel Lopez
+
+This distribution contains a modified build of NVIDIA NeMo-Speech.cpp.
+Upstream source: https://github.com/NVIDIA/NeMo-Speech.cpp
+Pinned commit: 4f9676226f667d14608487df744f375db87127f8
+
+Modification: realtime-language-v1.patch adds a runtime capability declaration
+to GET /ready and transports final ASR language metadata separately from the
+transcript. No other functional source modification is authorized.
+
+The Nemotron speech model is not included. NVIDIA GPU drivers are not included.
+Third-party license texts and the machine-readable inventory are included in
+each runtime ZIP.

@@ -1,0 +1,31 @@
+diff --git a/server/http/http_server.cpp b/server/http/http_server.cpp
+--- a/server/http/http_server.cpp
++++ b/server/http/http_server.cpp
+@@ -446,11 +446,14 @@ struct Server::Impl {
+         server->Get("/ready", [this](const httplib::Request&, httplib::Response& response) {
+             Value body(Value::Object{});
+             body["ready"] = this->models.ready();
+             body["device"] = this->models.device_label();
+             Value::Array capabilities;
+             for (const auto& capability : this->models.capabilities())
+                 capabilities.emplace_back(capability);
+             body["capabilities"] = std::move(capabilities);
++            Value::Array runtime_capabilities;
++            runtime_capabilities.emplace_back("realtime-language-v1");
++            body["runtime_capabilities"] = std::move(runtime_capabilities);
+             response.status = this->models.ready() ? 200 : 503;
+             response.set_content(body.dump(), "application/json");
+         });
+@@ -898,8 +901,12 @@ struct Server::Impl {
+                 event["type"] = result.is_final
+                                     ? "conversation.item.input_audio_transcription.completed"
+                                     : "conversation.item.input_audio_transcription.delta";
+                 if (result.is_final) {
+                     event["transcript"] = alternative.transcript;
++                    if (alternative.language_codes.size() == 1)
++                        event["language"] = alternative.language_codes.front();
++                    else if (alternative.language_codes.size() > 1)
++                        event["language_status"] = "ambiguous";
+                     partial_transcript.clear();
+                 } else {
+                     const bool extends_previous =

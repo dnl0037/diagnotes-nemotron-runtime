@@ -1,0 +1,58 @@
+name: Build final Windows runtime ZIPs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-${{ matrix.backend }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, cuda]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout recipe
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Record runner
+        shell: pwsh
+        run: |
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber | ConvertTo-Json
+          "ImageOS=$env:ImageOS"
+          "ImageVersion=$env:ImageVersion"
+
+      - name: Build final ZIP
+        id: build
+        shell: pwsh
+        run: |
+          .\scripts\Build-Runtime.ps1 -Backend '${{ matrix.backend }}' -Configuration Release -CudaArch '75;80;86;89' -CudaVersion '12.8'
+          $zip = Get-ChildItem -LiteralPath .\artifacts -File -Filter '*.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'Build produced no ZIP.' }
+          "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
+          "zip_name=$($zip.Name)" >> $env:GITHUB_OUTPUT
+          Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256
+
+      - name: Attest final ZIP bytes
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: ${{ steps.build.outputs.zip_path }}
+          show-summary: false
+
+      - name: Upload final ZIP and build evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: runtime-${{ matrix.backend }}-${{ github.run_id }}
+          path: |
+            ${{ steps.build.outputs.zip_path }}
+            artifacts/evidence-${{ matrix.backend }}/**
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

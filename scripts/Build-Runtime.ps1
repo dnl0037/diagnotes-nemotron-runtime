@@ -72,20 +72,345 @@ if ($hunks.Count -ne 2) { throw "Expected exactly two functional hunks, got $($h
 
 if ($Backend -eq 'cuda') {
     $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$CudaVersion"
+    if (Test-Path -LiteralPath "$cudaRoot\bin\nvcc.exe") {
+        throw 'Unexpected pre-existing CUDA 12.8 toolkit; the authorized causal installer repetition cannot be skipped.'
+    }
+
+    $installer = Join-Path $WorkRoot 'cuda_12.8.0_windows_network.exe'
+    Invoke-WebRequest -Uri $CudaInstallerUrl -OutFile $installer
+    $installerSha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+    $installerMd5 = (Get-FileHash -LiteralPath $installer -Algorithm MD5).Hash
+    if ($installerSha -ne $CudaInstallerSha256 -or $installerMd5 -ne $CudaInstallerMd5) {
+        throw "Pinned CUDA installer hash mismatch: sha256=$installerSha md5=$installerMd5"
+    }
+
+    # The installer wrapper is blocked on a named event until its process has
+    # been assigned to a kill-on-close Job Object. This makes the 20-minute
+    # limit cover the wrapper, bootstrapper, and ordinary descendants without
+    # changing the pinned installer or its exact component allowlist.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class DiagNotesWindowsJob {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS {
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+        public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, IntPtr returnedLength);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
+
+    public static IntPtr CreateKillOnClose() {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        limits.BasicLimitInformation.LimitFlags = 0x00002000;
+        int size = Marshal.SizeOf(limits);
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+            Marshal.StructureToPtr(limits, buffer, false);
+            if (!SetInformationJobObject(job, 9, buffer, (uint)size))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        } catch { CloseHandle(job); throw; }
+        finally { Marshal.FreeHGlobal(buffer); }
+        return job;
+    }
+    public static void Assign(IntPtr job, IntPtr process) {
+        if (!AssignProcessToJobObject(job, process))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public static uint ActiveProcesses(IntPtr job) {
+        int size = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+            if (!QueryInformationJobObject(job, 1, buffer, (uint)size, IntPtr.Zero))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            var value = (JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(
+                buffer, typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+            return value.ActiveProcesses;
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    public static void Terminate(IntPtr job) {
+        if (!TerminateJobObject(job, 124))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+}
+'@
+
+    function Get-NvidiaState {
+        $services = @(Get-CimInstance Win32_Service | Where-Object {
+            $_.Name -match '(?i)nvidia|cuda' -or $_.DisplayName -match '(?i)nvidia|cuda'
+        } | Sort-Object Name | Select-Object Name, DisplayName, State, StartMode, PathName)
+        $tasks = @(Get-ScheduledTask | Where-Object {
+            $_.TaskName -match '(?i)nvidia|cuda' -or $_.TaskPath -match '(?i)nvidia|cuda'
+        } | Sort-Object TaskPath, TaskName | Select-Object TaskPath, TaskName, State)
+        return [ordered]@{ services=$services; tasks=$tasks }
+    }
+
+    function Get-InstallerLogSnapshot {
+        $roots = @(
+            (Join-Path $env:ProgramFiles 'NVIDIA Corporation\Installer2'),
+            (Join-Path $env:ProgramData 'NVIDIA Corporation\Installer2'),
+            (Join-Path $env:TEMP 'CUDA'),
+            (Join-Path $env:TEMP 'NVIDIA')
+        ) | Where-Object { Test-Path -LiteralPath $_ }
+        $snapshot = @{}
+        foreach ($root in $roots) {
+            Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+                $_.Extension -match '(?i)^\.(log|txt|json|xml)$' -and
+                -not $_.FullName.StartsWith($WorkRoot, [StringComparison]::OrdinalIgnoreCase)
+            } | ForEach-Object {
+                $snapshot[$_.FullName] = "$($_.Length)|$($_.LastWriteTimeUtc.Ticks)"
+            }
+        }
+        return $snapshot
+    }
+
+    function Write-SanitizedInstallerLog {
+        param([Parameter(Mandatory)][string]$InputPath, [Parameter(Mandatory)][string]$OutputPath)
+        $content = if (Test-Path -LiteralPath $InputPath) {
+            Get-Content -LiteralPath $InputPath -Raw -ErrorAction Stop
+        } else { '' }
+        foreach ($privateRoot in @($env:RUNNER_TEMP, $env:GITHUB_WORKSPACE, $env:USERPROFILE, $WorkRoot)) {
+            if ($privateRoot) { $content = $content.Replace($privateRoot, '<private-path>') }
+        }
+        $content = $content -replace '(?i)(authorization|bearer|token|secret|password)\s*[:=]\s*\S+', '$1=<redacted>'
+        $content = $content -replace '(https?://[^\s?]+)\?\S+', '$1?<redacted-query>'
+        if (-not $content) { $content = '<empty>' }
+        $content | Set-Content -LiteralPath $OutputPath -Encoding utf8NoBOM
+    }
+
+    $coordinationId = [Guid]::NewGuid().ToString('N')
+    $coordinationRoot = Join-Path $WorkRoot "cuda-installer-$coordinationId"
+    New-Item -ItemType Directory -Force -Path $coordinationRoot | Out-Null
+    $wrapperPath = Join-Path $coordinationRoot 'Invoke-CudaInstaller.ps1'
+    $resultPath = Join-Path $coordinationRoot 'result.json'
+    $wrapperStdout = Join-Path $coordinationRoot 'wrapper.stdout.log'
+    $wrapperStderr = Join-Path $coordinationRoot 'wrapper.stderr.log'
+    $installerStdout = Join-Path $coordinationRoot 'installer.stdout.log'
+    $installerStderr = Join-Path $coordinationRoot 'installer.stderr.log'
+    $eventName = "Local\DiagNotesCudaInstaller-$coordinationId"
+
+    @'
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$result = [ordered]@{ status='coordinator_error'; started_utc=$null; ended_utc=$null; bootstrapper_exit_code=$null; wrapper_expected_exit_code=125; error_type=$null; error_message=$null }
+try {
+    $gate = [Threading.EventWaitHandle]::OpenExisting($env:DN_CUDA_EVENT)
+    try {
+        if (-not $gate.WaitOne(60000)) { throw 'Installer coordination event was not released.' }
+    } finally { $gate.Dispose() }
+    $result.started_utc = [DateTimeOffset]::UtcNow.ToString('O')
+    $arguments = @('-s','-n','nvcc_12.8','cudart_12.8','cublas_12.8','cublas_dev_12.8','thrust_12.8')
+    $process = Start-Process -FilePath $env:DN_CUDA_INSTALLER -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $env:DN_CUDA_INSTALLER_STDOUT -RedirectStandardError $env:DN_CUDA_INSTALLER_STDERR
+    $result.ended_utc = [DateTimeOffset]::UtcNow.ToString('O')
+    $result.bootstrapper_exit_code = $process.ExitCode
+    $result.wrapper_expected_exit_code = if ($process.ExitCode -eq 0) { 0 } else { 1 }
+    $result.status = if ($process.ExitCode -eq 0) { 'completed' } else { 'bootstrapper_failed' }
+} catch {
+    $result.ended_utc = [DateTimeOffset]::UtcNow.ToString('O')
+    $result.error_type = $_.Exception.GetType().FullName
+    $result.error_message = $_.Exception.Message
+}
+$temporary = "$($env:DN_CUDA_RESULT).tmp"
+[IO.File]::WriteAllText($temporary, ($result | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+Move-Item -LiteralPath $temporary -Destination $env:DN_CUDA_RESULT
+exit $result.wrapper_expected_exit_code
+'@ | Set-Content -LiteralPath $wrapperPath -Encoding utf8NoBOM
+
+    $installerArguments = @('-s','-n','nvcc_12.8','cudart_12.8','cublas_12.8','cublas_dev_12.8','thrust_12.8')
+    if (($installerArguments -join ' ') -match '(?i)Display\.Driver' -or $installerArguments.Count -ne 7) {
+        throw 'CUDA installer argument allowlist changed or includes Display.Driver.'
+    }
+
+    $driverBeforePath = Join-Path $coordinationRoot 'drivers-before.txt'
+    $driverAfterPath = Join-Path $coordinationRoot 'drivers-after.txt'
+    (& pnputil.exe /enum-drivers 2>&1 | Out-String) | Set-Content -LiteralPath $driverBeforePath -Encoding utf8NoBOM
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to inventory Windows driver packages before CUDA installation.' }
+    $driverBeforeHash = (Get-FileHash -LiteralPath $driverBeforePath -Algorithm SHA256).Hash
+    $nvidiaStateBefore = Get-NvidiaState
+    $logSnapshotBefore = Get-InstallerLogSnapshot
+
+    $env:DN_CUDA_EVENT = $eventName
+    $env:DN_CUDA_INSTALLER = $installer
+    $env:DN_CUDA_RESULT = $resultPath
+    $env:DN_CUDA_INSTALLER_STDOUT = $installerStdout
+    $env:DN_CUDA_INSTALLER_STDERR = $installerStderr
+    $createdNew = $false
+    $gate = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $eventName, [ref]$createdNew)
+    if (-not $createdNew) { $gate.Dispose(); throw 'CUDA installer coordination event unexpectedly existed.' }
+    $jobHandle = [IntPtr]::Zero
+    $wrapper = $null
+    $releasedAt = $null
+    $observedAt = $null
+    $timedOut = $false
+    $coordinationFailure = $null
+    try {
+        $jobHandle = [DiagNotesWindowsJob]::CreateKillOnClose()
+        $wrapper = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-File',$wrapperPath) -PassThru -WindowStyle Hidden -RedirectStandardOutput $wrapperStdout -RedirectStandardError $wrapperStderr
+        [DiagNotesWindowsJob]::Assign($jobHandle, $wrapper.Handle)
+        if ([DiagNotesWindowsJob]::ActiveProcesses($jobHandle) -lt 1) { throw 'CUDA installer Job Object contains no wrapper process.' }
+        $releasedAt = [DateTimeOffset]::UtcNow
+        [void]$gate.Set()
+        if (-not $wrapper.WaitForExit(20 * 60 * 1000)) {
+            $timedOut = $true
+            $observedAt = [DateTimeOffset]::UtcNow
+            [DiagNotesWindowsJob]::Terminate($jobHandle)
+            $drainDeadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+            while ([DiagNotesWindowsJob]::ActiveProcesses($jobHandle) -ne 0 -and [DateTimeOffset]::UtcNow -lt $drainDeadline) {
+                Start-Sleep -Milliseconds 250
+            }
+            if ([DiagNotesWindowsJob]::ActiveProcesses($jobHandle) -ne 0) { throw 'CUDA installer Job Object did not drain after timeout.' }
+            throw 'CUDA installer process tree exceeded the authorized 20-minute limit.'
+        }
+        $observedAt = [DateTimeOffset]::UtcNow
+        if ([DiagNotesWindowsJob]::ActiveProcesses($jobHandle) -ne 0) { throw 'CUDA installer Job Object was not empty after wrapper completion.' }
+    } catch {
+        $coordinationFailure = $_
+        if ($null -eq $observedAt) { $observedAt = [DateTimeOffset]::UtcNow }
+    } finally {
+        $gate.Dispose()
+        if ($jobHandle -ne [IntPtr]::Zero) { [void][DiagNotesWindowsJob]::CloseHandle($jobHandle) }
+    }
+
+    Write-SanitizedInstallerLog -InputPath $wrapperStdout -OutputPath (Join-Path $EvidenceRoot 'cuda-installer-wrapper-stdout.log')
+    Write-SanitizedInstallerLog -InputPath $wrapperStderr -OutputPath (Join-Path $EvidenceRoot 'cuda-installer-wrapper-stderr.log')
+    Write-SanitizedInstallerLog -InputPath $installerStdout -OutputPath (Join-Path $EvidenceRoot 'cuda-installer-stdout.log')
+    Write-SanitizedInstallerLog -InputPath $installerStderr -OutputPath (Join-Path $EvidenceRoot 'cuda-installer-stderr.log')
+
+    if ($null -ne $coordinationFailure) {
+        $failedCoordination = [ordered]@{
+            schema='diagnotes-cuda-installer-v1'; status='coordination_failed'
+            released_utc=if ($releasedAt) { $releasedAt.ToString('O') } else { $null }
+            observed_utc=$observedAt.ToString('O'); timeout_seconds=1200; timed_out=$timedOut
+            failure=$coordinationFailure.Exception.Message
+        }
+        $failedCoordination | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'cuda-installer-result.json') -Encoding utf8NoBOM
+        $failedCoordination | ConvertTo-Json -Depth 5
+        throw $coordinationFailure.Exception.Message
+    }
+    if ($timedOut -or -not (Test-Path -LiteralPath $resultPath)) { throw 'CUDA installer produced no complete coordination result.' }
+    $installerResult = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+    if ($installerResult.status -notin @('completed','bootstrapper_failed')) {
+        [ordered]@{
+            schema='diagnotes-cuda-installer-v1'; status='wrapper_failed'
+            released_utc=$releasedAt.ToString('O'); observed_utc=$observedAt.ToString('O')
+            timeout_seconds=1200; timed_out=$false; wrapper_exit_code=$wrapper.ExitCode
+            wrapper_error_type=$installerResult.error_type; wrapper_error_message=$installerResult.error_message
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'cuda-installer-result.json') -Encoding utf8NoBOM
+        throw 'CUDA installer coordinator failed before obtaining a bootstrapper result.'
+    }
+    if ($wrapper.ExitCode -ne $installerResult.wrapper_expected_exit_code) { throw 'CUDA wrapper and atomic result exit codes disagree.' }
+    $installerStarted = [DateTimeOffset]::Parse($installerResult.started_utc)
+    $installerEnded = [DateTimeOffset]::Parse($installerResult.ended_utc)
+    if ($installerStarted -lt $releasedAt -or $installerEnded -lt $installerStarted -or $installerEnded -gt $observedAt) {
+        throw 'CUDA installer result timestamps fall outside the coordinated process window.'
+    }
+
+    (& pnputil.exe /enum-drivers 2>&1 | Out-String) | Set-Content -LiteralPath $driverAfterPath -Encoding utf8NoBOM
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to inventory Windows driver packages after CUDA installation.' }
+    $driverAfterHash = (Get-FileHash -LiteralPath $driverAfterPath -Algorithm SHA256).Hash
+    $nvidiaStateAfter = Get-NvidiaState
+    $logSnapshotAfter = Get-InstallerLogSnapshot
+    $changedNativeLogs = @($logSnapshotAfter.Keys | Where-Object {
+        -not $logSnapshotBefore.ContainsKey($_) -or $logSnapshotBefore[$_] -ne $logSnapshotAfter[$_]
+    } | Sort-Object)
+    $nativeLogEvidence = @()
+    $nativeLogIndex = 0
+    foreach ($nativeLog in $changedNativeLogs) {
+        $nativeLogIndex++
+        $sanitizedName = "cuda-installer-native-$nativeLogIndex.log"
+        Write-SanitizedInstallerLog -InputPath $nativeLog -OutputPath (Join-Path $EvidenceRoot $sanitizedName)
+        $nativeLogEvidence += [ordered]@{ evidence=$sanitizedName; size=(Get-Item -LiteralPath $nativeLog).Length; sha256=(Get-FileHash -LiteralPath $nativeLog -Algorithm SHA256).Hash }
+    }
+
+    $nvidiaStateBeforeJson = $nvidiaStateBefore | ConvertTo-Json -Depth 8 -Compress
+    $nvidiaStateAfterJson = $nvidiaStateAfter | ConvertTo-Json -Depth 8 -Compress
+    $lingeringInstallers = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)cuda.*(setup|install)|nvidia.*(setup|install)' })
+    $installerEvidence = [ordered]@{
+        schema='diagnotes-cuda-installer-v1'; installer_url=$CudaInstallerUrl
+        installer_sha256=$installerSha; installer_md5=$installerMd5
+        arguments=$installerArguments; display_driver_requested=$false
+        released_utc=$releasedAt.ToString('O'); started_utc=$installerResult.started_utc
+        ended_utc=$installerResult.ended_utc; observed_exit_utc=$observedAt.ToString('O')
+        timeout_seconds=1200; timed_out=$timedOut
+        bootstrapper_exit_code=$installerResult.bootstrapper_exit_code
+        wrapper_exit_code=$wrapper.ExitCode
+        driver_inventory_before_sha256=$driverBeforeHash
+        driver_inventory_after_sha256=$driverAfterHash
+        nvidia_service_task_state_unchanged=($nvidiaStateBeforeJson -ceq $nvidiaStateAfterJson)
+        lingering_installer_processes=@($lingeringInstallers | Select-Object -ExpandProperty ProcessName)
+        sanitized_native_logs=$nativeLogEvidence
+    }
+    $installerEvidencePath = Join-Path $EvidenceRoot 'cuda-installer-result.json'
+    $installerEvidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $installerEvidencePath -Encoding utf8NoBOM
+    $installerEvidence | ConvertTo-Json -Depth 8
+
+    if ($installerResult.bootstrapper_exit_code -ne 0) { throw "Pinned CUDA installer failed with exit code $($installerResult.bootstrapper_exit_code)." }
+    if ($driverBeforeHash -ne $driverAfterHash) { throw 'Windows driver package inventory changed during CUDA installation.' }
+    if ($nvidiaStateBeforeJson -cne $nvidiaStateAfterJson) { throw 'NVIDIA service or scheduled-task inventory changed during CUDA installation.' }
+    if ($lingeringInstallers.Count -ne 0) { throw 'A CUDA/NVIDIA installer process remained after the coordinated tree completed.' }
+
+    $componentFiles = [ordered]@{
+        nvcc_12_8 = @('bin\nvcc.exe','bin\nvcc.profile','nvvm\bin\cicc.exe')
+        cudart_12_8 = @('bin\cudart64_12.dll')
+        cublas_12_8 = @('bin\cublas64_12.dll','bin\cublasLt64_12.dll')
+        cublas_dev_12_8 = @('include\cublas_v2.h','lib\x64\cublas.lib','lib\x64\cublasLt.lib')
+        thrust_12_8 = @('include\thrust\version.h')
+    }
+    $componentInventory = @()
+    foreach ($component in $componentFiles.GetEnumerator()) {
+        $files = @($component.Value | ForEach-Object {
+            $path = Join-Path $cudaRoot $_
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "CUDA component inventory lacks $($component.Key): $_" }
+            [ordered]@{ path=$_.Replace('\','/'); size=(Get-Item -LiteralPath $path).Length; sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+        })
+        $componentInventory += [ordered]@{ component=$component.Key.Replace('_','.'); files=$files }
+    }
+    $cudaVersionMetadata = Join-Path $cudaRoot 'version.json'
+    if (-not (Test-Path -LiteralPath $cudaVersionMetadata)) { throw 'CUDA 12.8 native version.json metadata is missing.' }
+    $cudaVersionRaw = Get-Content -LiteralPath $cudaVersionMetadata -Raw
+    if ($cudaVersionRaw -notmatch '12\.8') { throw 'CUDA native version metadata does not identify 12.8.' }
+    [ordered]@{
+        schema='diagnotes-cuda-component-inventory-v1'; toolkit='12.8'
+        version_json_sha256=(Get-FileHash -LiteralPath $cudaVersionMetadata -Algorithm SHA256).Hash
+        components=$componentInventory; display_driver_in_allowlist=$false
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'cuda-component-inventory.json') -Encoding utf8NoBOM
+
     if (-not (Test-Path -LiteralPath "$cudaRoot\bin\nvcc.exe")) {
-        $installer = Join-Path $WorkRoot 'cuda_12.8.0_windows_network.exe'
-        Invoke-WebRequest -Uri $CudaInstallerUrl -OutFile $installer
-        $installerSha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-        $installerMd5 = (Get-FileHash -LiteralPath $installer -Algorithm MD5).Hash
-        if ($installerSha -ne $CudaInstallerSha256 -or $installerMd5 -ne $CudaInstallerMd5) {
-            throw "Pinned CUDA installer hash mismatch: sha256=$installerSha md5=$installerMd5"
-        }
-        # Official silent subpackage identifiers from the CUDA 12.8 Windows guide.
-        # Deliberately exclude Display.Driver and all profiling/IDE components.
-        Invoke-Checked $installer -s -n nvcc_12.8 cudart_12.8 cublas_12.8 cublas_dev_12.8 thrust_12.8
-        if (-not (Test-Path -LiteralPath "$cudaRoot\bin\nvcc.exe")) {
-            throw "Pinned minimal CUDA Toolkit install did not produce $cudaRoot\bin\nvcc.exe"
-        }
+        throw "Pinned minimal CUDA Toolkit install did not produce $cudaRoot\bin\nvcc.exe"
     }
     $env:CUDA_PATH = $cudaRoot
     $env:CUDA_PATH_V12_8 = $cudaRoot

@@ -43,12 +43,34 @@ $fixtureResults = @($fixtures | ForEach-Object {
     [ordered]@{ name=$_.name; expected=$_.expected; actual=$actual; passed=($actual -eq $_.expected) }
 })
 
+$environmentFixtureName = 'DIAGNOTES_RECIPE_ENV_' + [Guid]::NewGuid().ToString('N')
+$environmentFixtureValue = [Guid]::NewGuid().ToString('N')
+$environmentFixtureScript = Join-Path ([IO.Path]::GetTempPath()) ($environmentFixtureName + '.ps1')
+try {
+    [IO.File]::WriteAllText(
+        $environmentFixtureScript,
+        "`$env:$environmentFixtureName = '$environmentFixtureValue'",
+        [Text.UTF8Encoding]::new($false)
+    )
+    & pwsh -NoProfile -File $environmentFixtureScript
+    $childProcessPreservedEnvironment =
+        [Environment]::GetEnvironmentVariable($environmentFixtureName, 'Process') -eq $environmentFixtureValue
+    & $environmentFixtureScript
+    $inProcessPreservedEnvironment =
+        [Environment]::GetEnvironmentVariable($environmentFixtureName, 'Process') -eq $environmentFixtureValue
+} finally {
+    Remove-Item -LiteralPath "env:$environmentFixtureName" -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $environmentFixtureScript -Force -ErrorAction SilentlyContinue
+}
+
 $profileBlock = [regex]::Match($buildText, '(?s)\$profileArgs\s*=\s*@\((.*?)\)\s*if \(\$Backend').Groups[1].Value
 $checks = @(
     [ordered]@{ name='powershell-parses'; passed=(@($parseErrors).Count -eq 0) },
     [ordered]@{ name='lid3-only'; passed=($buildText -match "nemo-speech-v0\.1\.0-diagnotes-lid\.3" -and $buildText -notmatch 'lid\.2') },
     [ordered]@{ name='static-md-only'; passed=($buildText -match '\$VcpkgTriplet\s*=\s*''x64-windows-static-md''' -and $buildText -notmatch "'-VcpkgTriplet', 'x64-windows-static'") },
     [ordered]@{ name='no-late-static-crt'; passed=($profileBlock -notmatch 'MultiThreaded|CMAKE_MSVC_RUNTIME_LIBRARY') },
+    [ordered]@{ name='upstream-in-process'; passed=($buildText -match '(?m)^& \$upstreamBuild @buildArgs$' -and $buildText -notmatch 'Invoke-Checked\s+pwsh\s+\$upstreamBuild') },
+    [ordered]@{ name='vcvars-environment-red-green'; passed=(-not $childProcessPreservedEnvironment -and $inProcessPreservedEnvironment) },
     [ordered]@{ name='legal-evidence-pinned'; passed=($buildText -match 'VsLicenseSha256' -and $buildText -match 'VsRedistListSha256' -and $buildText -match 'Visual-Studio-2022-Redistribution') },
     [ordered]@{ name='pe-and-defender-gates'; passed=($buildText -match 'Resolve-PeClosure' -and $buildText -match 'Get-MpComputerStatus' -and $buildText -match 'defender\.json') },
     [ordered]@{ name='clean-unique-root'; passed=($buildText -match 'GITHUB_RUN_ATTEMPT' -and $buildText -match 'Unique clean work root already exists') },

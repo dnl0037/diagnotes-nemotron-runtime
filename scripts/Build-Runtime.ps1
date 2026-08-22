@@ -410,7 +410,10 @@ $buildArgs = @(
     '-Jobs', '4'
 )
 if ($Backend -eq 'cuda') { $buildArgs += @('-CudaArch', $CudaArch, '-CublasShim') }
-Invoke-Checked pwsh $upstreamBuild @buildArgs
+# Run upstream in-process so its vcvars64 import remains available for the
+# contracted ASR+HTTP-only reconfigure below. A child pwsh discards INCLUDE,
+# LIB, and LIBPATH on exit and makes the otherwise valid MSVC build non-repeatable.
+& $upstreamBuild @buildArgs
 
 # Reconfigure the upstream ASR preset to the contracted ASR+HTTP-only surface.
 $profileArgs = @(

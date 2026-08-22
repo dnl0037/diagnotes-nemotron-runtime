@@ -57,6 +57,13 @@ if ($patchRaw -contains 13) { throw 'Canonical patch must use LF only.' }
 if ($patchRaw[-1] -ne 10 -or $patchRaw[-2] -eq 10) { throw 'Canonical patch must end in exactly one LF.' }
 
 New-Item -ItemType Directory -Force -Path $WorkRoot, $ArtifactsRoot, $EvidenceRoot | Out-Null
+if ($Backend -eq 'cuda') {
+    $sanitizerEvidenceRoot = Join-Path $ArtifactsRoot 'sanitizer-preflight'
+    $sanitizerEvidencePath = Join-Path $sanitizerEvidenceRoot 'sanitizer-preflight.json'
+    $sanitizerTestPath = Join-Path $RepoRoot 'scripts\Test-BuildRuntimeHelpers.ps1'
+    New-Item -ItemType Directory -Force -Path $sanitizerEvidenceRoot | Out-Null
+    Invoke-Checked pwsh -NoLogo -NoProfile -NonInteractive -File $sanitizerTestPath -BuildScriptPath $PSCommandPath -EvidencePath $sanitizerEvidencePath
+}
 Invoke-Checked git clone --filter=blob:none https://github.com/NVIDIA/NeMo-Speech.cpp.git $SourceRoot
 Invoke-Checked git -C $SourceRoot checkout --detach $SourceCommit
 if ((git -C $SourceRoot rev-parse HEAD).Trim() -ne $SourceCommit) { throw 'Detached source pin mismatch.' }
@@ -200,16 +207,30 @@ public static class DiagNotesWindowsJob {
 
     function Write-SanitizedInstallerLog {
         param([Parameter(Mandatory)][string]$InputPath, [Parameter(Mandatory)][string]$OutputPath)
-        $content = if (Test-Path -LiteralPath $InputPath) {
-            Get-Content -LiteralPath $InputPath -Raw -ErrorAction Stop
-        } else { '' }
-        foreach ($privateRoot in @($env:RUNNER_TEMP, $env:GITHUB_WORKSPACE, $env:USERPROFILE, $WorkRoot)) {
-            if ($privateRoot) { $content = $content.Replace($privateRoot, '<private-path>') }
+        $content = [string]::Empty
+        if (Test-Path -LiteralPath $InputPath -PathType Leaf) {
+            $readContent = Get-Content -LiteralPath $InputPath -Raw -ErrorAction Stop
+            if ($null -ne $readContent) { $content = [string]$readContent }
         }
-        $content = $content -replace '(?i)(authorization|bearer|token|secret|password)\s*[:=]\s*\S+', '$1=<redacted>'
-        $content = $content -replace '(https?://[^\s?]+)\?\S+', '$1?<redacted-query>'
-        if (-not $content) { $content = '<empty>' }
-        $content | Set-Content -LiteralPath $OutputPath -Encoding utf8NoBOM
+        foreach ($privateRoot in @($env:RUNNER_TEMP, $env:GITHUB_WORKSPACE, $env:USERPROFILE, $WorkRoot)) {
+            if (-not $privateRoot) { continue }
+            $root = ([string]$privateRoot).TrimEnd([char[]]@('\', '/'))
+            $variants = @($root, $root.Replace('\', '/'), $root.Replace('/', '\')) | Sort-Object -Unique
+            foreach ($variant in $variants) {
+                $content = [regex]::Replace(
+                    $content,
+                    [regex]::Escape($variant),
+                    '<private-path>',
+                    [Text.RegularExpressions.RegexOptions]::IgnoreCase
+                )
+            }
+        }
+        $content = $content -replace '(?im)\b(authorization)\s*[:=]\s*[^\r\n]+', '$1=<redacted>'
+        $content = $content -replace '(?im)\b(bearer)\s+[^\s,\r\n]+', '$1 <redacted>'
+        $content = $content -replace '(?im)(["'']?(?:token|secret|password)["'']?\s*[:=]\s*)[^\r\n]+', '$1<redacted>'
+        $content = $content -replace '(?i)((?:https?://|/)[^\s?]+)\?[^\s#]+', '$1?<redacted-query>'
+        if ([string]::IsNullOrEmpty($content)) { $content = '<empty>' }
+        [IO.File]::WriteAllText($OutputPath, $content, [Text.UTF8Encoding]::new($false))
     }
 
     $coordinationId = [Guid]::NewGuid().ToString('N')

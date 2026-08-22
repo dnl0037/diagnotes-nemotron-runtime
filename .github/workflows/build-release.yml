@@ -56,3 +56,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - name: Upload sanitizer preflight evidence
+        if: ${{ always() && matrix.backend == 'cuda' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sanitizer-preflight-${{ matrix.backend }}-${{ github.run_id }}
+          path: artifacts/sanitizer-preflight/sanitizer-preflight.json
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0

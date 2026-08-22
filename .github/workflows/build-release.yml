@@ -29,6 +29,12 @@ jobs:
           "ImageOS=$env:ImageOS"
           "ImageVersion=$env:ImageVersion"
 
+      - name: Prove sanitizer before CUDA
+        if: ${{ matrix.backend == 'cuda' }}
+        shell: pwsh
+        run: |
+          .\scripts\Test-BuildRuntimeHelpers.ps1 -BuildScriptPath .\scripts\Build-Runtime.ps1 -EvidencePath .\artifacts\sanitizer-preflight\sanitizer-preflight.json
+
       - name: Build final ZIP
         id: build
         shell: pwsh

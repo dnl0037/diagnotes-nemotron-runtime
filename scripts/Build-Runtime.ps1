@@ -62,7 +62,8 @@ if ($Backend -eq 'cuda') {
     $sanitizerEvidencePath = Join-Path $sanitizerEvidenceRoot 'sanitizer-preflight.json'
     $sanitizerTestPath = Join-Path $RepoRoot 'scripts\Test-BuildRuntimeHelpers.ps1'
     New-Item -ItemType Directory -Force -Path $sanitizerEvidenceRoot | Out-Null
-    Invoke-Checked pwsh -NoLogo -NoProfile -NonInteractive -File $sanitizerTestPath -BuildScriptPath $PSCommandPath -EvidencePath $sanitizerEvidencePath
+    $sanitizerTestArguments = @('-NoLogo','-NoProfile','-NonInteractive','-File',$sanitizerTestPath,'-BuildScriptPath',$PSCommandPath,'-EvidencePath',$sanitizerEvidencePath)
+    Invoke-Checked -FilePath pwsh -Arguments $sanitizerTestArguments
 }
 Invoke-Checked git clone --filter=blob:none https://github.com/NVIDIA/NeMo-Speech.cpp.git $SourceRoot
 Invoke-Checked git -C $SourceRoot checkout --detach $SourceCommit

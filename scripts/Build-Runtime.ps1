@@ -18,6 +18,9 @@ $PatchSha256 = '80370907878F346B16AD27933B1CF9109C0C204198702D5307CD4C6434D63E84
 $PatchBytes = 1793
 $Version = 'nemo-speech-v0.1.0-diagnotes-lid.2'
 $ExpectedVcpkgCommit = '9e593bb18ea69cc5095e012465dcd675a822ed0d'
+$CudaInstallerUrl = 'https://developer.download.nvidia.com/compute/cuda/12.8.0/network_installers/cuda_12.8.0_windows_network.exe'
+$CudaInstallerSha256 = '89E7C44B526B6E30EC5089F221E918090D11F1D5B33C48FBFE08C6AC13F8A95C'
+$CudaInstallerMd5 = '1D7E1CF4047F2B8D9A8096E18EBEA1C7'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PatchPath = Join-Path $RepoRoot 'patches\realtime-language-v1.patch'
 $WorkRoot = Join-Path $env:RUNNER_TEMP "diagnotes-runtime-$Backend"
@@ -70,7 +73,19 @@ if ($hunks.Count -ne 2) { throw "Expected exactly two functional hunks, got $($h
 if ($Backend -eq 'cuda') {
     $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$CudaVersion"
     if (-not (Test-Path -LiteralPath "$cudaRoot\bin\nvcc.exe")) {
-        throw "Pinned CUDA Toolkit $CudaVersion is not present at $cudaRoot"
+        $installer = Join-Path $WorkRoot 'cuda_12.8.0_windows_network.exe'
+        Invoke-WebRequest -Uri $CudaInstallerUrl -OutFile $installer
+        $installerSha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+        $installerMd5 = (Get-FileHash -LiteralPath $installer -Algorithm MD5).Hash
+        if ($installerSha -ne $CudaInstallerSha256 -or $installerMd5 -ne $CudaInstallerMd5) {
+            throw "Pinned CUDA installer hash mismatch: sha256=$installerSha md5=$installerMd5"
+        }
+        # Official silent subpackage identifiers from the CUDA 12.8 Windows guide.
+        # Deliberately exclude Display.Driver and all profiling/IDE components.
+        Invoke-Checked $installer -s -n nvcc_12.8 cudart_12.8 cublas_12.8 cublas_dev_12.8 thrust_12.8
+        if (-not (Test-Path -LiteralPath "$cudaRoot\bin\nvcc.exe")) {
+            throw "Pinned minimal CUDA Toolkit install did not produce $cudaRoot\bin\nvcc.exe"
+        }
     }
     $env:CUDA_PATH = $cudaRoot
     $env:CUDA_PATH_V12_8 = $cudaRoot
@@ -175,6 +190,7 @@ $toolchain = [ordered]@{
     windows_sdk = $env:WindowsSDKVersion
     vcpkg_commit = $ExpectedVcpkgCommit
     cuda = if ($Backend -eq 'cuda') { (& "$env:CUDA_PATH\bin\nvcc.exe" --version | Select-Object -Last 1) } else { $null }
+    cuda_installer = if ($Backend -eq 'cuda') { [ordered]@{ url=$CudaInstallerUrl; sha256=$CudaInstallerSha256; md5=$CudaInstallerMd5; components=@('nvcc_12.8','cudart_12.8','cublas_12.8','cublas_dev_12.8','thrust_12.8'); driver=$false } } else { $null }
     cmake_profile = [ordered]@{ asr=$true; http=$true; cli=$true; diar=$false; tts=$false; nmt=$false; mic_capture=$false }
     authenticode = 'absent-by-contract'
 }

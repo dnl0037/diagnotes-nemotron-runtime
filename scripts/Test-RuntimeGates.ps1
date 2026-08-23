@@ -482,8 +482,15 @@ try {
     $repoRootForProbe = Split-Path -Parent $PSScriptRoot
     $repoStatusBefore = @(git -C $repoRootForProbe status --porcelain=v1 --untracked-files=all) -join "`n"
     $guardRoot = Join-Path $env:LOCALAPPDATA ('DiagNotes\RuntimeBuild\guard-' + [Guid]::NewGuid().ToString('N'))
-    $noLocalOutput = (& pwsh -NoLogo -NoProfile -NonInteractive -File $resolvedBuild -Backend cpu 2>&1 | Out-String)
-    $noLocalExit = $LASTEXITCODE
+    $nonGitHubEnvironment = Get-ProcessEnvironmentMap
+    try {
+        foreach ($key in @([Environment]::GetEnvironmentVariables('Process').Keys | Where-Object { [string]$_ -match '^(?i:GITHUB_|RUNNER_)' })) {
+            [Environment]::SetEnvironmentVariable([string]$key, $null, 'Process')
+            Remove-Item -LiteralPath "Env:$key" -ErrorAction SilentlyContinue
+        }
+        $noLocalOutput = (& pwsh -NoLogo -NoProfile -NonInteractive -File $resolvedBuild -Backend cpu 2>&1 | Out-String)
+        $noLocalExit = $LASTEXITCODE
+    } finally { Restore-ProcessEnvironmentMap -Snapshot $nonGitHubEnvironment }
     Add-CaseResult -Group entrypoint-guard -Name nonlocal-outside-github-red -Passed ($noLocalExit -ne 0 -and $noLocalOutput -match 'requires a coherent GitHub Actions environment')
     $guardEnvironment = Get-ProcessEnvironmentMap
     try {

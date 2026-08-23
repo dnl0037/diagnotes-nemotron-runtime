@@ -776,7 +776,7 @@ function Assert-AssetSnapshot {
 
 function Assert-NoClobberArgument {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string[]]$Arguments)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
 
     if (@($Arguments | Where-Object { $_ -ieq '--clobber' }).Count -ne 0) {
         throw 'Asset replacement with --clobber is forbidden.'

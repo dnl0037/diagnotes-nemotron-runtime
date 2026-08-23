@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)][string]$AssetRoot,
     [Parameter(Mandatory)][string]$DownloadRoot,
-    [Parameter(Mandatory)][string]$EvidencePath
+    [Parameter(Mandatory)][string]$EvidencePath,
+    [Parameter(ValueFromRemainingArguments)][string[]]$AdditionalArguments = @()
 )
 
 Set-StrictMode -Version Latest
@@ -19,7 +20,7 @@ $evidenceParent = Split-Path -Parent $evidenceFull
 Assert-SafeExistingOutsideCheckoutPath -LiteralPath $evidenceParent -CheckoutRoot $checkout -Label 'EvidencePath parent' | Out-Null
 if (Test-Path -LiteralPath $evidenceFull) { throw 'EvidencePath must not preexist.' }
 
-Assert-NoClobberArgument -Arguments $args | Out-Null
+Assert-NoClobberArgument -Arguments @($AdditionalArguments) | Out-Null
 Assert-NoBuildIntent -Text $MyInvocation.Line | Out-Null
 $processStart = Assert-NoBuildProcesses
 

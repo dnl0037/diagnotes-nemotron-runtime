@@ -135,6 +135,7 @@ try {
     Invoke-Negative 'preexisting draft' { Assert-EmptyReleaseSurface @([pscustomobject]@{ draft = $true }) '' }
     Invoke-Negative 'preexisting tag' { Assert-EmptyReleaseSurface @() 'abc refs/tags/existing' }
     Invoke-Negative 'clobber argument' { Assert-NoClobberArgument @('upload', '--clobber') }
+    Invoke-Positive 'empty explicit extra arguments' { Assert-NoClobberArgument @() }
 
     $validDraft = [pscustomobject]@{ tag_name = $contract.Tag; target_commitish = $contract.TargetCommit; draft = $true; prerelease = $false }
     Invoke-Positive 'exact private draft' { Assert-DraftReleaseContract $validDraft $contract.Tag $contract.TargetCommit }

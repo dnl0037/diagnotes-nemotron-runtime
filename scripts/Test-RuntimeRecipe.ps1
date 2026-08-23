@@ -31,7 +31,7 @@ $classificationText = if ($classificationStart -ge 0 -and $classificationEnd -gt
 
 $checks = @(
     [pscustomobject]@{ name='powershell-parses'; passed=(@($parseResults | Where-Object errors -ne 0).Count -eq 0) },
-    [pscustomobject]@{ name='lid3-only'; passed=($buildText -match 'nemo-speech-v0\.1\.0-diagnotes-lid\.3' -and $buildText -notmatch 'lid\.2') },
+    [pscustomobject]@{ name='lid4-only'; passed=($buildText -match 'nemo-speech-v0\.1\.0-diagnotes-lid\.4' -and $buildText -notmatch 'lid\.(?:2|3)') },
     [pscustomobject]@{ name='static-md-pin'; passed=($buildText -match '\$VcpkgTriplet\s*=\s*''x64-windows-static-md''' -and $buildText -notmatch 'VcpkgTriplet\s*=\s*''x64-windows-static''') },
     [pscustomobject]@{ name='compile-db-exported'; passed=($buildText -match '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' -and $buildText -notmatch "'-DCMAKE_EXPORT_COMPILE_COMMANDS=ON'" -and $buildText -match 'compile_commands\.json') },
     [pscustomobject]@{ name='exact-crt-token-contract'; passed=($buildText -match "'/MT','-MT','/MTd','-MTd','/MDd','-MDd'" -and $buildText -match "'-MD'" -and $buildText -match "'-c'") },
@@ -46,7 +46,8 @@ $checks = @(
         $buildText -match '\$postBuildPrivacyViolations\s*=\s*@\(Get-EvidencePrivacyViolations' -and
         $buildText.IndexOf('$postBuildPrivacyViolations') -gt $buildText.IndexOf("'build-result.json'")
     ) },
-    [pscustomobject]@{ name='payload-closure-integrated'; passed=($buildText -match 'function Test-PayloadMetadataClosure' -and $buildText -match "scope='payload-only'" -and $buildText -match "exclusions=@\('inventory\.json','sbom\.spdx\.json'\)" -and $buildText -match "id='payload-closure'; dependencies=@\('inventory','sbom'\)" -and $buildText -match "id='zip-extraction'; dependencies=@\('payload-closure'\)" -and $buildText.IndexOf('if (Test-GateObservationPassed payload-closure)') -ge 0 -and $buildText.IndexOf('if (Test-GateObservationPassed payload-closure)') -lt $buildText.IndexOf('Compress-Archive')) },
+    [pscustomobject]@{ name='payload-closure-integrated'; passed=($buildText -match 'function Test-PayloadMetadataClosure' -and $buildText -match "scope='payload-only'" -and $buildText -match "exclusions=@\('inventory\.json','sbom\.spdx\.json'\)" -and $buildText -match "id='payload-closure'; dependencies=@\('inventory','sbom'\)" -and $buildText -match "id='path-privacy-prepackage'; dependencies=@\('payload-closure'\)" -and $buildText -match "id='zip-extraction'; dependencies=@\('path-privacy-prepackage'\)" -and $buildText.IndexOf('if (Test-GateObservationPassed payload-closure)') -ge 0 -and $buildText.IndexOf('if (Test-GateObservationPassed payload-closure)') -lt $buildText.IndexOf('Compress-Archive')) },
+    [pscustomobject]@{ name='universal-path-privacy-integrated'; passed=($buildText -match 'Test-PathPrivacyContract' -and $buildText -match 'configure-privacy-barrier\.json' -and $buildText -match 'path-privacy-prepackage\.json' -and $buildText -match 'path-privacy-postpackage\.json' -and $buildText -match 'Dismount-NeutralBuildRoot') },
     [pscustomobject]@{ name='detached-metadata-contract'; passed=($buildText -match 'diagnotes-payload-metadata-evidence-v1' -and $buildText -match 'Join-Path \$EvidenceRoot ''payload-metadata\.json''' -and $buildText -match 'serialized metadata divergence') },
     [pscustomobject]@{ name='nvcc-forwarded-crt-only'; passed=($buildText -match 'if \(\$isNvcc\) \{ @\(\$forwarded\.ToArray\(\)\) \}' -and $buildText -match 'ambiguous CRT forwarding') },
     [pscustomobject]@{ name='redist-closure-exhaustive'; passed=($buildText -match 'function Test-MsvcRedistFileContract' -and $buildText -match 'function Test-MsvcRedistClosureContract' -and $buildText -match 'presentMsvc') },

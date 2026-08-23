@@ -375,7 +375,7 @@ $evidenceJson = $null
 try {
     New-Item -ItemType Directory -Path $resolvedWork | Out-Null
     $zip = Get-Item -LiteralPath $ZipPath
-    $expectedName = if ($Backend -eq 'cpu') { 'nemo-speech-v0.1.0-diagnotes-lid.3-windows-x86_64-cpu.zip' } else { 'nemo-speech-v0.1.0-diagnotes-lid.3-windows-x86_64-cuda-sm75-sm80-sm86-sm89.zip' }
+    $expectedName = if ($Backend -eq 'cpu') { 'nemo-speech-v0.1.0-diagnotes-lid.4-windows-x86_64-cpu.zip' } else { 'nemo-speech-v0.1.0-diagnotes-lid.4-windows-x86_64-cuda-sm75-sm80-sm86-sm89.zip' }
     $zipHash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash
     if ($zip.Name -cne $expectedName -or $zipHash -cne $ExpectedZipSha256) { throw 'Candidate ZIP identity or digest mismatch.' }
 

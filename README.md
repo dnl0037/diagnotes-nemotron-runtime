@@ -6,7 +6,7 @@ This repository does **not** contain a speech model, audio, transcripts, caption
 
 ## Frozen identity
 
-- Runtime: `nemo-speech-v0.1.0-diagnotes-lid.3`
+- Runtime: `nemo-speech-v0.1.0-diagnotes-lid.4`
 - Upstream: NeMo-Speech.cpp commit `4f9676226f667d14608487df744f375db87127f8`
 - Functional patch: `realtime-language-v1.patch`, 1,793 bytes, SHA-256 `80370907878F346B16AD27933B1CF9109C0C204198702D5307CD4C6434D63E84`
 - Windows x86_64 CPU and CUDA builds; CUDA architectures `75;80;86;89` (never `native`)
@@ -17,16 +17,24 @@ The CUDA package requires a compatible NVIDIA driver supplied by the host. It do
 
 Both packages use the upstream `x64-windows-static-md` profile: vcpkg libraries are static and the Release MSVC CRT is dynamic. Required Microsoft CRT DLLs are copied app-local from the Redist directory of the effective toolchain, so consumers do not need Visual Studio. Each ZIP includes the applicable Visual Studio license terms, the official REDIST list, PE closure, versions, origins, and SHA-256 hashes. The informational Visual C++ Runtime license alone is not treated as redistribution permission.
 
-## Build
+## Local release-candidate provenance
 
-The manually dispatched workflow builds final ZIP bytes on GitHub-hosted Windows runners, records the effective toolchain, uploads the bytes, and produces GitHub artifact attestations. Actions are pinned by full commit SHA and have no release-write permission. Release creation and publication are deliberately outside the workflow.
+The `lid.4` release candidates use `local-build-local-verification` provenance. They were built and tested locally from fresh roots, then frozen at these exact digests:
+
+- CPU: 2,640,737 bytes; SHA-256 `26357B22CF0A4B7B59D980AD06068C998339DF21F76B5A57FA381CD238D2889B`
+- CUDA: 170,665,359 bytes; SHA-256 `89CA829838353F81F920C75B829C82C7B68F02DA275D704DD71B099B5EE6240D`
+
+GitHub only hosts the draft assets. It did not build these bytes, and this repository does not claim SLSA or GitHub Actions build provenance for them. The historical build workflow is not the provenance of these candidates.
+
+The local promotion helpers verify the frozen sizes and hashes, scan each ZIP and a fresh extraction with Microsoft Defender, close inventory/SBOM/licenses/NOTICE/patch/PE dependencies, reject models and private paths, assemble the seven release assets outside the checkout, and verify an authenticated draft redownload. They never build or modify either ZIP:
 
 ```powershell
-pwsh .\scripts\Build-Runtime.ps1 -Backend cpu -Configuration Release
-pwsh .\scripts\Build-Runtime.ps1 -Backend cuda -CudaArch '75;80;86;89' -Configuration Release
+pwsh .\scripts\Test-LocalRuntimePromotion.ps1 -CpuZipPath <cpu.zip> -CudaZipPath <cuda.zip> -CpuAcceptanceEvidencePath <cpu-acceptance.json> -CudaAcceptanceEvidencePath <cuda-acceptance.json> -AssetRoot <prepared-asset-root>
+pwsh .\scripts\Prepare-LocalRuntimeDraft.ps1 -CpuZipPath <cpu.zip> -CudaZipPath <cuda.zip> -CpuAcceptanceEvidencePath <cpu-acceptance.json> -CudaAcceptanceEvidencePath <cuda-acceptance.json> -WorkRoot <fresh-work-root> -AssetRoot <fresh-asset-root>
+pwsh .\scripts\Publish-LocalRuntimeDraft.ps1 -AssetRoot <asset-root> -DownloadRoot <fresh-download-root> -EvidencePath <new-evidence.json>
 ```
 
-No output is reproducible byte-for-byte because the hosted Windows image and MSVC toolset are recorded rather than content-addressed. Provenance attestation links final ZIP digests to the workflow; it does not establish compiler safety, legal compliance, or absence of vulnerabilities.
+The draft targets the exact pushed `main` commit containing these promotion helpers and this README. It remains non-consumer-ready until separately fiscalized and explicitly published. The compatible model is not included and must be obtained under its separate license.
 
 ## License
 

@@ -14,6 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+Import-Module (Join-Path $PSScriptRoot 'RuntimePathPrivacy.psm1') -Force
 
 function Test-AttestationVerificationDocument {
     param(
@@ -153,6 +154,7 @@ try {
         'Resolve-PeClosure',
         'ConvertFrom-WindowsCommandLine',
         'Test-CompileCommandsContract',
+        'Test-NinjaPdbAltPathContract',
         'Get-RuntimeGateManifest',
         'Invoke-RuntimeGateGraph',
         'Set-GateObservation',
@@ -173,7 +175,7 @@ try {
         ObservedSourceCommit='4f9676226f667d14608487df744f375db87127f8'
         ObservedPatchSha256='80370907878F346B16AD27933B1CF9109C0C204198702D5307CD4C6434D63E84'
         ObservedPatchBytes=1793
-        ObservedVersion='nemo-speech-v0.1.0-diagnotes-lid.3'
+        ObservedVersion='nemo-speech-v0.1.0-diagnotes-lid.4'
         ObservedTriplet='x64-windows-static-md'
         ObservedCudaArch='75;80;86;89'
         ObservedVcpkgCommit='9e593bb18ea69cc5095e012465dcd675a822ed0d'
@@ -243,8 +245,11 @@ try {
         'NEMO_SPEECH_BUILD_MIC_CAPTURE:BOOL=OFF',
         'VCPKG_TARGET_TRIPLET:STRING=x64-windows-static-md',
         'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON',
+        'CMAKE_EXE_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%',
+        'CMAKE_SHARED_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%',
+        'CMAKE_MODULE_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%',
         'CMAKE_TOOLCHAIN_FILE:FILEPATH=C:/vcpkg/scripts/buildsystems/vcpkg.cmake',
-        'CMAKE_CXX_COMPILER:FILEPATH=C:/VS/cl.exe',
+        'CMAKE_CXX_COMPILER:STRING=C:/VS/cl.exe',
         'MSVC_REDIST_DIR:PATH=C:/VS/VC/Redist/MSVC/14.44.35112',
         'CMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL',
         'CMAKE_CUDA_ARCHITECTURES:STRING=75;80;86;89'
@@ -253,7 +258,8 @@ try {
         [pscustomobject]@{ name='lf'; text=($baseCacheLines -join "`n") + "`n" },
         [pscustomobject]@{ name='crlf'; text=($baseCacheLines -join "`r`n") + "`r`n" },
         [pscustomobject]@{ name='eof'; text=($baseCacheLines -join "`n") },
-        [pscustomobject]@{ name='comments-order'; text=((@('# comment','', $baseCacheLines[4]) + $baseCacheLines[0..3] + $baseCacheLines[5..($baseCacheLines.Count - 1)]) -join "`n") }
+        [pscustomobject]@{ name='comments-order'; text=((@('# comment','', $baseCacheLines[4]) + $baseCacheLines[0..3] + $baseCacheLines[5..($baseCacheLines.Count - 1)]) -join "`n") },
+        [pscustomobject]@{ name='compiler-filepath'; text=(($baseCacheLines -replace '^CMAKE_CXX_COMPILER:STRING=', 'CMAKE_CXX_COMPILER:FILEPATH=') -join "`n") }
     )) {
         $actual = Test-CMakeCacheContract -Text $fixture.text -RequestedBackend cuda -RequestedTriplet 'x64-windows-static-md' -RequestedCudaArch '75;80;86;89'
         Add-CaseResult -Group cache-positive -Name $fixture.name -Passed $actual.passed
@@ -270,10 +276,13 @@ try {
         static_crt = $baseCacheLines -replace 'MultiThreadedDLL', 'MultiThreaded'
         debug_crt = $baseCacheLines -replace 'MultiThreadedDLL', 'MultiThreadedDebugDLL'
         export_off = $baseCacheLines -replace 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON', 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=OFF'
+        compiler_wrong_type = $baseCacheLines -replace '^CMAKE_CXX_COMPILER:STRING=', 'CMAKE_CXX_COMPILER:BOOL='
         export_uninitialized = $baseCacheLines -replace 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON', 'CMAKE_EXPORT_COMPILE_COMMANDS:UNINITIALIZED=ON'
         export_wrong_type = $baseCacheLines -replace 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON', 'CMAKE_EXPORT_COMPILE_COMMANDS:STRING=ON'
         export_missing = @($baseCacheLines | Where-Object { $_ -cne 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' })
         export_duplicate = $baseCacheLines + 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON'
+        pdbalt_missing = @($baseCacheLines | Where-Object { $_ -notmatch '^CMAKE_SHARED_LINKER_FLAGS:' })
+        pdbalt_absolute = $baseCacheLines -replace '^CMAKE_EXE_LINKER_FLAGS:STRING=.*$', 'CMAKE_EXE_LINKER_FLAGS:STRING=/PDB:C:/private/runtime.pdb'
         malformed = $baseCacheLines -replace '^CMAKE_TOOLCHAIN_FILE:', 'CMAKE_TOOLCHAIN_FILE :'
         bare_cr = @($baseCacheLines[0..4] + ("$($baseCacheLines[5])`r$($baseCacheLines[6])") + $baseCacheLines[7..($baseCacheLines.Count - 1)])
         redist_missing = @($baseCacheLines | Where-Object { $_ -notmatch '^MSVC_REDIST_DIR:' })
@@ -323,6 +332,28 @@ try {
     foreach ($fixture in $compileFixtures) {
         $actual = Test-CompileCommandsContract -Json $fixture.json
         Add-CaseResult -Group compile -Name $fixture.name -Passed (($actual.passed -eq $fixture.expected) -and ($actual.inspectable -eq $fixture.inspectable))
+    }
+
+    $ninjaPdbFixtures = @(
+        [pscustomobject]@{ name='exe-shared-green-static-excluded'; expected=$true; text=@'
+build libfixture.lib: CXX_STATIC_LIBRARY_LINKER__fixture_Release one.obj
+  LINK_FLAGS = /machine:x64
+build fixture.dll: CXX_SHARED_LIBRARY_LINKER__fixture_Release two.obj
+  LINK_FLAGS = /machine:x64 /PDBALTPATH:%_PDB%
+build fixture.exe: CXX_EXECUTABLE_LINKER__fixture_Release three.obj
+  LINK_FLAGS = /machine:x64 /PDBALTPATH:%_PDB%
+'@ },
+        [pscustomobject]@{ name='exe-missing-red'; expected=$false; text=@'
+build fixture.exe: CXX_EXECUTABLE_LINKER__fixture_Release one.obj
+  LINK_FLAGS = /machine:x64
+'@ },
+        [pscustomobject]@{ name='only-static-red'; expected=$false; text=@'
+build libfixture.lib: CXX_STATIC_LIBRARY_LINKER__fixture_Release one.obj
+  LINK_FLAGS = /machine:x64
+'@ }
+    )
+    foreach ($fixture in $ninjaPdbFixtures) {
+        Add-CaseResult -Group pdbalt-ninja -Name $fixture.name -Passed ((Test-NinjaPdbAltPathContract -Text $fixture.text).passed -eq $fixture.expected)
     }
 
     $legacyCrtCases = @(
@@ -538,8 +569,9 @@ try {
         '-DNEMO_SPEECH_WITH_GRPC=OFF','-DNEMO_SPEECH_BUILD_TESTS=OFF','-DBUILD_TESTING=OFF',
         '-DNEMO_SPEECH_BUILD_EXAMPLES=OFF','-DNEMO_SPEECH_BUILD_TOOLS=OFF'
     )
-    $expectedCpuProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=OFF','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_GGML_PATCHED=OFF'))
-    $expectedCudaProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=ON','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_CUBLAS_SHIM=ON','-DCMAKE_CUDA_ARCHITECTURES:STRING=75;80;86;89'))
+    $pdbAltProfile = @('-DCMAKE_EXE_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%','-DCMAKE_SHARED_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%','-DCMAKE_MODULE_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%')
+    $expectedCpuProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + $pdbAltProfile + @('-DGGML_CUDA=OFF','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_GGML_PATCHED=OFF'))
+    $expectedCudaProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + $pdbAltProfile + @('-DGGML_CUDA=ON','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_CUBLAS_SHIM=ON','-DCMAKE_CUDA_ARCHITECTURES:STRING=75;80;86;89'))
     Add-CaseResult -Group semantic-diff -Name 'cpu-baseline-plus-export-only' -Passed (($cpuProfile | ConvertTo-Json -Compress) -ceq ($expectedCpuProfile | ConvertTo-Json -Compress))
     Add-CaseResult -Group semantic-diff -Name 'cuda-baseline-plus-export-only' -Passed (($cudaProfile | ConvertTo-Json -Compress) -ceq ($expectedCudaProfile | ConvertTo-Json -Compress))
     Add-CaseResult -Group semantic-diff -Name 'cuda-architectures-retyped-string' -Passed (
@@ -756,7 +788,7 @@ try {
 
     $manifest = @(Get-RuntimeGateManifest)
     $ids = @($manifest | ForEach-Object id)
-    Add-CaseResult -Group dag -Name 'stable-unique-ids' -Passed (($ids.Count -eq 19) -and (@($ids | Sort-Object -Unique).Count -eq 19))
+    Add-CaseResult -Group dag -Name 'stable-unique-ids' -Passed (($ids.Count -eq 21) -and (@($ids | Sort-Object -Unique).Count -eq 21))
     $allPass = [ordered]@{}
     foreach ($id in $ids) { $allPass[$id] = [pscustomobject]@{ status='PASS'; reason='fixture green' } }
     $greenResults = @(Invoke-RuntimeGateGraph -Manifest $manifest -Observations $allPass)
@@ -891,7 +923,7 @@ try {
         else { throw 'Payload probe path boundary failed.' }
     }
 
-    foreach ($gateId in @('source-patch','cache','compile-arguments-inspectable','crt','profile','legal','pe-closure','inventory','sbom','payload-closure','zip-extraction','defender-tree','defender-zip','privacy','attestation-created','attestation-digest-verified')) {
+    foreach ($gateId in @('source-patch','cache','compile-arguments-inspectable','crt','profile','legal','pe-closure','inventory','sbom','payload-closure','path-privacy-prepackage','zip-extraction','defender-tree','defender-zip','path-privacy','privacy','attestation-created','attestation-digest-verified')) {
         $mutated = [ordered]@{}
         foreach ($entry in $allPass.GetEnumerator()) { $mutated[$entry.Key] = $entry.Value }
         $mutated[$gateId] = [pscustomobject]@{ status='FAIL'; reason="mutated $gateId" }
@@ -978,8 +1010,12 @@ try {
     Add-CaseResult -Group downstream-parsers -Name 'signer-status-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status HashMismatch -Subject 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'))
     Add-CaseResult -Group downstream-parsers -Name 'redist-unsigned-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status NotSigned -Subject 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'))
     Add-CaseResult -Group downstream-parsers -Name 'redist-other-signer-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status Valid -Subject 'CN=Microsoft Windows, O=Contoso Corporation, C=US'))
-    $redistPathGreenEntries = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC/14.44.35112").entries
-    Add-CaseResult -Group redist-path -Name same-install-family-green -Passed (Resolve-MsvcRedistFromCacheContract -Entries $redistPathGreenEntries).passed
+    $redistPathGreenEntries = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:STRING=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC/14.44.35112").entries
+    Add-CaseResult -Group redist-path -Name same-install-family-string-green -Passed (Resolve-MsvcRedistFromCacheContract -Entries $redistPathGreenEntries).passed
+    $redistPathFileEntries = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC/14.44.35112").entries
+    Add-CaseResult -Group redist-path -Name same-install-family-filepath-green -Passed (Resolve-MsvcRedistFromCacheContract -Entries $redistPathFileEntries).passed
+    $redistWrongCompilerType = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:BOOL=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC/14.44.35112").entries
+    Add-CaseResult -Group redist-path -Name compiler-type-red -Passed (-not (Resolve-MsvcRedistFromCacheContract -Entries $redistWrongCompilerType).passed)
     $redistOtherInstall = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/VS-A/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/VS-B/VC/Redist/MSVC/14.44.35112").entries
     Add-CaseResult -Group redist-path -Name other-install-red -Passed (-not (Resolve-MsvcRedistFromCacheContract -Entries $redistOtherInstall).passed)
     $redistOtherFamily = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/VS/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/VS/VC/Redist/MSVC/14.43.35112").entries

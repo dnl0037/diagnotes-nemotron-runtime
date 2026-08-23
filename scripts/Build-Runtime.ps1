@@ -16,11 +16,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+Import-Module (Join-Path $PSScriptRoot 'RuntimePathPrivacy.psm1') -Force
 
 $SourceCommit = '4f9676226f667d14608487df744f375db87127f8'
 $PatchSha256 = '80370907878F346B16AD27933B1CF9109C0C204198702D5307CD4C6434D63E84'
 $PatchBytes = 1793
-$Version = 'nemo-speech-v0.1.0-diagnotes-lid.3'
+$Version = 'nemo-speech-v0.1.0-diagnotes-lid.4'
 $VcpkgTriplet = 'x64-windows-static-md'
 $ExpectedVcpkgCommit = '9e593bb18ea69cc5095e012465dcd675a822ed0d'
 $CudaInstallerUrl = 'https://developer.download.nvidia.com/compute/cuda/12.8.0/network_installers/cuda_12.8.0_windows_network.exe'
@@ -45,6 +46,15 @@ $ExecutionMode = if ($Local) { 'local' } else { 'github' }
 $RecipeCommit = $null
 $LocalBuildBase = $null
 $LocalCudaProofPath = $null
+$PhysicalWorkRoot = $null
+$PhysicalEvidenceRoot = $null
+$NeutralMount = $null
+$PrivatePathRoots = @()
+$PrivatePathLeafRoots = @()
+$VcpkgSeedRoot = $null
+$primaryFailure = $null
+$cleanupFailures = [Collections.Generic.List[string]]::new()
+$finalResultJson = $null
 
 function Invoke-Checked {
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
@@ -155,6 +165,7 @@ function Resolve-LocalBuildTools {
         ninja = Join-Path $vsInstall 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
         cl = Join-Path $hostBin 'cl.exe'
         dumpbin = Join-Path $hostBin 'dumpbin.exe'
+        vsdevcmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
     }
     foreach ($entry in $tools.GetEnumerator()) {
         if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) { throw "Local Build Tools lacks $($entry.Key)." }
@@ -171,7 +182,50 @@ function Resolve-LocalBuildTools {
         ninja=$tools.ninja
         cl=$tools.cl
         dumpbin=$tools.dumpbin
+        vsdevcmd=$tools.vsdevcmd
     }
+}
+
+function Import-VsDevEnvironment {
+    param([Parameter(Mandatory)][string]$BatchPath)
+    if (-not (Test-Path -LiteralPath $BatchPath -PathType Leaf)) { throw 'VsDevCmd.bat is missing.' }
+    $command = '"' + $BatchPath + '" -arch=x64 -host_arch=x64 >nul && set'
+    $lines = @(& $env:ComSpec /d /s /c $command)
+    if ($LASTEXITCODE -ne 0) { throw 'VsDevCmd environment import failed.' }
+    foreach ($line in $lines) {
+        $position = $line.IndexOf('=')
+        if ($position -gt 0) {
+            [Environment]::SetEnvironmentVariable($line.Substring(0,$position), $line.Substring($position + 1), 'Process')
+        }
+    }
+}
+
+function Initialize-PinnedNeutralVcpkg {
+    param(
+        [Parameter(Mandatory)][string]$RequestedRoot,
+        [Parameter(Mandatory)][string]$ExpectedCommit,
+        [string]$SeedRoot
+    )
+    if (Test-Path -LiteralPath $RequestedRoot) { throw 'Neutral vcpkg root must be fresh.' }
+    [void](Invoke-Checked git clone --filter=blob:none https://github.com/microsoft/vcpkg.git $RequestedRoot)
+    [void](Invoke-Checked git -C $RequestedRoot checkout --detach $ExpectedCommit)
+    $head = ((git -C $RequestedRoot rev-parse HEAD) | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $head -cne $ExpectedCommit) { throw 'Neutral vcpkg checkout pin mismatch.' }
+    $bootstrap = Join-Path $RequestedRoot 'bootstrap-vcpkg.bat'
+    if (-not (Test-Path -LiteralPath $bootstrap -PathType Leaf)) { throw 'Neutral vcpkg bootstrap is missing.' }
+    $bootstrapOutput = @(& $bootstrap -disableMetrics 2>&1)
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $RequestedRoot 'vcpkg.exe') -PathType Leaf)) {
+        throw 'Neutral vcpkg bootstrap failed.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SeedRoot)) {
+        $seedDownloads = Join-Path $SeedRoot 'vcpkg\downloads'
+        if (Test-Path -LiteralPath $seedDownloads -PathType Container) {
+            $destinationDownloads = Join-Path $RequestedRoot 'downloads'
+            New-Item -ItemType Directory -Force -Path $destinationDownloads | Out-Null
+            Copy-Item -Path (Join-Path $seedDownloads '*') -Destination $destinationDownloads -Recurse -Force
+        }
+    }
+    return [pscustomobject]@{ root=$RequestedRoot; commit=$head; executable=Join-Path $RequestedRoot 'vcpkg.exe' }
 }
 
 function Resolve-MsvcRedistFromCacheContract {
@@ -186,7 +240,7 @@ function Resolve-MsvcRedistFromCacheContract {
     if ($errors.Count -ne 0) { return [pscustomobject]@{ passed=$false; errors=@($errors) } }
     $clEntry = $Entries['CMAKE_CXX_COMPILER']
     $redistEntry = $Entries['MSVC_REDIST_DIR']
-    if ($clEntry.type -cne 'FILEPATH') { $errors += 'CMAKE_CXX_COMPILER type' }
+    if ($clEntry.type -cnotin @('FILEPATH','STRING')) { $errors += 'CMAKE_CXX_COMPILER type' }
     if ($redistEntry.type -cne 'PATH') { $errors += 'MSVC_REDIST_DIR type' }
     $clPath = [IO.Path]::GetFullPath(([string]$clEntry.value).Replace('/','\')).TrimEnd('\')
     $redistVersionRoot = [IO.Path]::GetFullPath(([string]$redistEntry.value).Replace('/','\')).TrimEnd('\')
@@ -499,7 +553,7 @@ function Test-RuntimeIdentityContract {
     if ($ObservedSourceCommit -cne '4f9676226f667d14608487df744f375db87127f8') { $errors += 'source commit' }
     if ($ObservedPatchSha256 -cne '80370907878F346B16AD27933B1CF9109C0C204198702D5307CD4C6434D63E84') { $errors += 'patch SHA-256' }
     if ($ObservedPatchBytes -ne 1793) { $errors += 'patch bytes' }
-    if ($ObservedVersion -cne 'nemo-speech-v0.1.0-diagnotes-lid.3') { $errors += 'identity' }
+    if ($ObservedVersion -cne 'nemo-speech-v0.1.0-diagnotes-lid.4') { $errors += 'identity' }
     if ($ObservedTriplet -cne 'x64-windows-static-md') { $errors += 'triplet' }
     if ($ObservedCudaArch -cne '75;80;86;89') { $errors += 'CUDA architecture matrix' }
     if ($ObservedVcpkgCommit -cne '9e593bb18ea69cc5095e012465dcd675a822ed0d') { $errors += 'vcpkg commit' }
@@ -531,6 +585,9 @@ function New-ProfileArguments {
         '-DBUILD_TESTING=OFF',
         '-DNEMO_SPEECH_BUILD_EXAMPLES=OFF',
         '-DNEMO_SPEECH_BUILD_TOOLS=OFF'
+        '-DCMAKE_EXE_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%'
+        '-DCMAKE_SHARED_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%'
+        '-DCMAKE_MODULE_LINKER_FLAGS:STRING=/PDBALTPATH:%_PDB%'
     )
     if ($ReassertToolchainFromCache) {
         $cachePath = Join-Path $RequestedBuildRoot 'CMakeCache.txt'
@@ -609,6 +666,9 @@ function Test-CMakeCacheContract {
         NEMO_SPEECH_BUILD_MIC_CAPTURE = @('BOOL','OFF')
         VCPKG_TARGET_TRIPLET = @('STRING',$RequestedTriplet)
         CMAKE_EXPORT_COMPILE_COMMANDS = @('BOOL','ON')
+        CMAKE_EXE_LINKER_FLAGS = @('STRING','/PDBALTPATH:%_PDB%')
+        CMAKE_SHARED_LINKER_FLAGS = @('STRING','/PDBALTPATH:%_PDB%')
+        CMAKE_MODULE_LINKER_FLAGS = @('STRING','/PDBALTPATH:%_PDB%')
     }
     if ($RequestedBackend -eq 'cuda') {
         $expected['CMAKE_CUDA_ARCHITECTURES'] = @('STRING',$RequestedCudaArch)
@@ -624,8 +684,8 @@ function Test-CMakeCacheContract {
         }
     }
     foreach ($requiredPath in @(
-        @('CMAKE_TOOLCHAIN_FILE','FILEPATH','vcpkg.cmake'),
-        @('CMAKE_CXX_COMPILER','FILEPATH','cl.exe')
+        @('CMAKE_TOOLCHAIN_FILE',@('FILEPATH'),'vcpkg.cmake'),
+        @('CMAKE_CXX_COMPILER',@('FILEPATH','STRING'),'cl.exe')
     )) {
         if (-not $parsed.entries.Contains($requiredPath[0])) {
             $errors += "missing $($requiredPath[0])"
@@ -633,7 +693,7 @@ function Test-CMakeCacheContract {
         }
         $entry = $parsed.entries[$requiredPath[0]]
         $leaf = [IO.Path]::GetFileName($entry.value.Replace('/','\'))
-        if ($entry.type -cne $requiredPath[1] -or $leaf -cne $requiredPath[2]) {
+        if ($entry.type -cnotin @($requiredPath[1]) -or $leaf -cne $requiredPath[2]) {
             $errors += "invalid $($requiredPath[0])"
         }
     }
@@ -1217,6 +1277,38 @@ function Test-CompileCommandsContract {
     }
 }
 
+function Test-NinjaPdbAltPathContract {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $records = @()
+    $lastOutput = $null
+    $lastRule = $null
+    foreach ($line in [regex]::Split($Text, "`r`n|`n")) {
+        if ($line -match '^build\s+(?<output>[^:]+):\s+(?<rule>\S+)') {
+            $lastOutput = (($Matches['output'] -split '\s+')[0] -replace '^.*[\\/]','')
+            $lastRule = $Matches['rule']
+            continue
+        }
+        if ($line -match '^\s*LINK_FLAGS\s*=\s*(?<flags>[^\r\n]*)$' -and $lastRule) {
+            $capturedFlags = $Matches['flags']
+            $isStaticArchive = $lastRule.IndexOf('STATIC_LIBRARY_LINKER', [StringComparison]::Ordinal) -ge 0
+            $records += [pscustomobject]@{
+                output=$lastOutput
+                rule=$lastRule
+                applicable=-not $isStaticArchive
+                has_pdbaltpath=$capturedFlags.IndexOf('/PDBALTPATH:%_PDB%', [StringComparison]::Ordinal) -ge 0
+            }
+        }
+    }
+    $applicable = @($records | Where-Object applicable)
+    $missing = @($applicable | Where-Object { -not $_.has_pdbaltpath })
+    return [pscustomobject]@{
+        passed=$applicable.Count -gt 0 -and $missing.Count -eq 0
+        applicable_count=$applicable.Count
+        static_archive_count=@($records | Where-Object { -not $_.applicable }).Count
+        missing=@($missing | Select-Object output,rule)
+    }
+}
+
 function Get-RuntimeGateManifest {
     return @(
         [pscustomobject]@{ id='source-patch'; dependencies=@() },
@@ -1230,11 +1322,13 @@ function Get-RuntimeGateManifest {
         [pscustomobject]@{ id='inventory'; dependencies=@('profile','legal','pe-closure') },
         [pscustomobject]@{ id='sbom'; dependencies=@('inventory') },
         [pscustomobject]@{ id='payload-closure'; dependencies=@('inventory','sbom') },
-        [pscustomobject]@{ id='zip-extraction'; dependencies=@('payload-closure') },
+        [pscustomobject]@{ id='path-privacy-prepackage'; dependencies=@('payload-closure') },
+        [pscustomobject]@{ id='zip-extraction'; dependencies=@('path-privacy-prepackage') },
         [pscustomobject]@{ id='defender-tree'; dependencies=@('zip-extraction') },
         [pscustomobject]@{ id='defender-zip'; dependencies=@('zip-extraction') },
-        [pscustomobject]@{ id='privacy'; dependencies=@() },
-        [pscustomobject]@{ id='candidate-bytes-ready'; dependencies=@('source-patch','cache','vcpkg','crt','profile','legal','pe-closure','inventory','sbom','zip-extraction','defender-tree','defender-zip','privacy') },
+        [pscustomobject]@{ id='path-privacy'; dependencies=@('zip-extraction') },
+        [pscustomobject]@{ id='privacy'; dependencies=@('path-privacy') },
+        [pscustomobject]@{ id='candidate-bytes-ready'; dependencies=@('source-patch','cache','vcpkg','crt','profile','legal','pe-closure','inventory','sbom','path-privacy-prepackage','zip-extraction','defender-tree','defender-zip','path-privacy','privacy') },
         [pscustomobject]@{ id='attestation-created'; dependencies=@('candidate-bytes-ready') },
         [pscustomobject]@{ id='attestation-digest-verified'; dependencies=@('attestation-created') },
         [pscustomobject]@{ id='candidate-upload-eligible'; dependencies=@('attestation-digest-verified') }
@@ -1313,17 +1407,49 @@ if ($Local) {
     $LocalBuildBase = $localRootContract.base
     $LocalCudaProofPath = Join-Path $LocalBuildBase 'cuda-12.8-install-proof.json'
     $runIdentity = [Guid]::NewGuid().ToString('N')
-    $WorkRoot = $localRootContract.root
-    $attemptRoot = Join-Path $WorkRoot "runs\$runIdentity"
-    $SourceRoot = Join-Path $WorkRoot 'source'
-    $BuildRoot = Join-Path $WorkRoot "build-$Backend"
+    $PhysicalWorkRoot = $localRootContract.root
+    $WorkRoot = $PhysicalWorkRoot
+    $NeutralMount = Mount-NeutralBuildRoot -PhysicalRoot $PhysicalWorkRoot
+    [void](Assert-NeutralBuildMount -Mount $NeutralMount)
+    $neutralRoot = [string]$NeutralMount.neutral_root
+    $attemptRoot = Join-Path $neutralRoot "runs\$runIdentity"
+    $SourceRoot = Join-Path $neutralRoot 'source'
+    $BuildRoot = Join-Path $neutralRoot "build-$Backend"
     $InstallRoot = Join-Path $attemptRoot 'install'
     $PackageRoot = Join-Path $attemptRoot 'package'
     $ArtifactsRoot = Join-Path $attemptRoot 'artifacts'
     $EvidenceRoot = Join-Path $ArtifactsRoot "evidence-$Backend"
+    $PhysicalEvidenceRoot = Join-Path $PhysicalWorkRoot "runs\$runIdentity\artifacts\evidence-$Backend"
     $vsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $localTools = Resolve-LocalBuildTools -VsWherePath $vsWhere
+    Import-VsDevEnvironment -BatchPath $localTools.vsdevcmd
     $env:Path = ((Split-Path -Parent $localTools.cmake),(Split-Path -Parent $localTools.ninja),(Split-Path -Parent $localTools.cl),$env:Path -join ';')
+    $neutralTemp = Join-Path $neutralRoot 'temp'
+    New-Item -ItemType Directory -Path $neutralTemp | Out-Null
+    $env:TEMP = $neutralTemp
+    $env:TMP = $neutralTemp
+    $env:VCPKG_DEFAULT_BINARY_CACHE = Join-Path $neutralRoot 'vcpkg-binary-cache'
+    New-Item -ItemType Directory -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+    $seedCandidates = @(Get-ChildItem -LiteralPath $LocalBuildBase -Directory | Where-Object {
+        -not $_.FullName.Equals($PhysicalWorkRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath (Join-Path $_.FullName 'vcpkg-binary-cache') -PathType Container) -and
+        (Test-Path -LiteralPath (Join-Path $_.FullName 'vcpkg\.git') -PathType Container)
+    } | Sort-Object LastWriteTime -Descending)
+    if ($seedCandidates.Count -gt 0) {
+        $seedHead = ((git -C (Join-Path $seedCandidates[0].FullName 'vcpkg') rev-parse HEAD 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $seedHead -ceq $ExpectedVcpkgCommit) {
+            $VcpkgSeedRoot = $seedCandidates[0].FullName
+            Copy-Item -Path (Join-Path $VcpkgSeedRoot 'vcpkg-binary-cache\*') -Destination $env:VCPKG_DEFAULT_BINARY_CACHE -Recurse -Force
+        }
+    }
+    $privateCandidates = @(
+        $PhysicalWorkRoot,$RepoRoot,(Split-Path -Parent $PatchPath),
+        [string]$processEnvironmentSnapshot['USERPROFILE'],[string]$processEnvironmentSnapshot['LOCALAPPDATA'],
+        [string]$processEnvironmentSnapshot['TEMP'],[string]$processEnvironmentSnapshot['TMP']
+    )
+    $PrivatePathRoots = @($privateCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [IO.Path]::GetFullPath([string]$_).TrimEnd('\','/') } | Sort-Object -Unique)
+    $PrivatePathLeafRoots = @($PhysicalWorkRoot)
     $RecipeCommit = ((git -C $RepoRoot rev-parse HEAD) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $RecipeCommit -notmatch '^[0-9a-f]{40}$') { throw 'Unable to identify the local recipe commit.' }
 } else {
@@ -1336,6 +1462,8 @@ if ($Local) {
     $ArtifactsRoot = Join-Path $RepoRoot 'artifacts'
     $EvidenceRoot = Join-Path $ArtifactsRoot "evidence-$Backend"
     $RecipeCommit = $env:GITHUB_SHA
+    $PrivatePathRoots = @($env:RUNNER_TEMP,$env:GITHUB_WORKSPACE,$env:USERPROFILE,$WorkRoot | Where-Object { $_ } | Sort-Object -Unique)
+    $PrivatePathLeafRoots = @($WorkRoot)
 }
 
 $identityContract = Test-RuntimeIdentityContract -ObservedSourceCommit $SourceCommit -ObservedPatchSha256 $PatchSha256 `
@@ -1373,6 +1501,22 @@ if ($Local) {
     New-Item -ItemType Directory -Path $WorkRoot | Out-Null
 }
 New-Item -ItemType Directory -Force -Path $ArtifactsRoot, $EvidenceRoot | Out-Null
+if ($Local) {
+    $markerMaterial = @($PrivatePathRoots | ForEach-Object { $_.Replace('\','/').ToLowerInvariant() }) -join "`n"
+    $markerHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($markerMaterial)))
+    [ordered]@{
+        schema='diagnotes-private-marker-manifest-v1'
+        exact_root_count=$PrivatePathRoots.Count
+        distinctive_leaf_count=$PrivatePathLeafRoots.Count
+        marker_manifest_sha256=$markerHash
+        generic_windows_profile_marker=$true
+        exact_profile_marker=$true
+        isolated_username_marker=$true
+        ascii_utf16_case_separator_coverage=$true
+        private_values_recorded=$false
+        privacy_module_sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'RuntimePathPrivacy.psm1') -Algorithm SHA256).Hash
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'private-marker-manifest.json') -Encoding utf8NoBOM
+}
 if ($Backend -eq 'cuda') {
     $sanitizerEvidenceRoot = Join-Path $ArtifactsRoot 'sanitizer-preflight'
     $sanitizerEvidencePath = Join-Path $sanitizerEvidenceRoot 'sanitizer-preflight.json'
@@ -1768,20 +1912,92 @@ if ($Backend -eq 'cuda') {
     }
 }
 
-$upstreamBuild = Join-Path $SourceRoot 'scripts\windows\build.ps1'
-$buildArgs = New-UpstreamBuildArguments -RequestedBackend $Backend -RequestedConfiguration $Configuration `
-    -RequestedBuildRoot $BuildRoot -RequestedTriplet $VcpkgTriplet -RequestedCudaArch $CudaArch
-# Run upstream in-process so its vcvars64 import remains available for the
-# contracted ASR+HTTP-only reconfigure below. A child pwsh discards INCLUDE,
-# LIB, and LIBPATH on exit and makes the otherwise valid MSVC build non-repeatable.
-& $upstreamBuild @buildArgs
+$configureBarrier = $null
+if ($Local) {
+    [void](Assert-NeutralBuildMount -Mount $NeutralMount)
+    $neutralVcpkgRoot = Join-Path ([string]$NeutralMount.neutral_root) 'vcpkg'
+    $neutralVcpkg = Initialize-PinnedNeutralVcpkg -RequestedRoot $neutralVcpkgRoot -ExpectedCommit $ExpectedVcpkgCommit -SeedRoot $VcpkgSeedRoot
+    $env:VCPKG_ROOT = $neutralVcpkg.root
+    $env:VCPKG_DISABLE_METRICS = '1'
+    if ($Backend -eq 'cuda') {
+        $ggmlPatchHelper = Join-Path $SourceRoot 'scripts\windows\apply-ggml-patches.ps1'
+        if (-not (Test-Path -LiteralPath $ggmlPatchHelper -PathType Leaf)) { throw 'Pinned CUDA ggml patch helper is missing.' }
+        & $ggmlPatchHelper
+        if ($LASTEXITCODE -ne 0) { throw 'Pinned CUDA ggml patch helper failed.' }
+    }
+    $profileArgs = New-ProfileArguments -RequestedBackend $Backend -RequestedSourceRoot $SourceRoot `
+        -RequestedBuildRoot $BuildRoot -RequestedCudaArch $CudaArch
+    $profileArgs += @(
+        '-G','Ninja',"-DCMAKE_BUILD_TYPE:STRING=$Configuration",
+        "-DCMAKE_MAKE_PROGRAM:FILEPATH=$($localTools.ninja)",
+        "-DCMAKE_C_COMPILER:FILEPATH=$($localTools.cl)","-DCMAKE_CXX_COMPILER:FILEPATH=$($localTools.cl)",
+        "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=$(Join-Path $neutralVcpkg.root 'scripts\buildsystems\vcpkg.cmake')",
+        "-DVCPKG_TARGET_TRIPLET:STRING=$VcpkgTriplet",'-DVCPKG_MANIFEST_FEATURES:STRING=asr',
+        "-DVCPKG_INSTALLED_DIR:PATH=$(Join-Path $BuildRoot 'vcpkg_installed')"
+    )
+    Invoke-Checked cmake @profileArgs
 
-# Reconfigure the upstream ASR preset to the contracted ASR+HTTP-only surface.
-$profileArgs = New-ProfileArguments -RequestedBackend $Backend -RequestedSourceRoot $SourceRoot `
-    -RequestedBuildRoot $BuildRoot -RequestedCudaArch $CudaArch -ReassertToolchainFromCache
-Invoke-Checked cmake @profileArgs
-Invoke-Checked cmake --build $BuildRoot --parallel 4
-Invoke-Checked cmake --install $BuildRoot --prefix $InstallRoot --config $Configuration
+    # Fail closed on the exact configured tree before Ninja can compile it.
+    [void](Assert-NeutralBuildMount -Mount $NeutralMount)
+    $configureFiles = @(
+        (Join-Path $BuildRoot 'CMakeCache.txt'),
+        (Join-Path $BuildRoot 'build.ninja'),
+        (Join-Path $BuildRoot 'compile_commands.json')
+    )
+    foreach ($configuredFile in $configureFiles) {
+        if (-not (Test-Path -LiteralPath $configuredFile -PathType Leaf)) { throw 'Configure-only barrier lacks a required original file.' }
+    }
+    $configurePrivacy = Test-PathPrivacyContract -LiteralPaths $configureFiles -PhysicalRoots $PrivatePathRoots `
+        -LeafPhysicalRoots $PrivatePathLeafRoots -UserProfile ([string]$processEnvironmentSnapshot['USERPROFILE']) `
+        -UserName ([Environment]::UserName) -RelativeTo $BuildRoot
+    if (-not $configurePrivacy.passed) {
+        $categories = @($configurePrivacy.violations.category | Sort-Object -Unique)
+        throw ('Configure-only privacy barrier failed: ' + ($categories -join ','))
+    }
+    $compileBarrierRaw = [IO.File]::ReadAllText((Join-Path $BuildRoot 'compile_commands.json'))
+    $compileBarrierContract = Test-CompileCommandsContract -Json $compileBarrierRaw
+    if (-not $compileBarrierContract.inspectable -or -not $compileBarrierContract.passed) {
+        throw 'Configure-only compile command contract is opaque or invalid.'
+    }
+    $ninjaBarrierText = [IO.File]::ReadAllText((Join-Path $BuildRoot 'build.ninja'))
+    $ninjaPdbContract = Test-NinjaPdbAltPathContract -Text $ninjaBarrierText
+    if (-not $ninjaPdbContract.passed) { throw 'An effective EXE, SHARED or MODULE Ninja link edge lacks /PDBALTPATH:%_PDB%.' }
+    $configuredRecords = @($configureFiles | ForEach-Object {
+        [ordered]@{ name=(Split-Path -Leaf $_); size=(Get-Item -LiteralPath $_).Length; sha256=(Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
+    })
+    $configureBarrier = [ordered]@{
+        schema='diagnotes-configure-privacy-barrier-v1'
+        passed=$true
+        same_tree_consumed_by_ninja=$true
+        scanner_violation_count=0
+        scanned_files=$configurePrivacy.scanned_files
+        compile_entries=$compileBarrierContract.count
+        compile_arguments_inspectable=$true
+        effective_link_edges=$ninjaPdbContract.applicable_count
+        static_archive_edges_excluded=$ninjaPdbContract.static_archive_count
+        all_link_edges_have_pdbaltpath=$true
+        response_arguments_opaque=$false
+        neutral_mount_verified_before_configure=$true
+        neutral_mount_verified_before_compile=$true
+        files=$configuredRecords
+        build_script_sha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        privacy_module_sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'RuntimePathPrivacy.psm1') -Algorithm SHA256).Hash
+        private_values_recorded=$false
+    }
+    $configureBarrier | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'configure-privacy-barrier.json') -Encoding utf8NoBOM
+    Invoke-Checked cmake --build $BuildRoot --parallel 4
+    Invoke-Checked cmake --install $BuildRoot --prefix $InstallRoot --config $Configuration
+} else {
+    $upstreamBuild = Join-Path $SourceRoot 'scripts\windows\build.ps1'
+    $buildArgs = New-UpstreamBuildArguments -RequestedBackend $Backend -RequestedConfiguration $Configuration `
+        -RequestedBuildRoot $BuildRoot -RequestedTriplet $VcpkgTriplet -RequestedCudaArch $CudaArch
+    & $upstreamBuild @buildArgs
+    $profileArgs = New-ProfileArguments -RequestedBackend $Backend -RequestedSourceRoot $SourceRoot `
+        -RequestedBuildRoot $BuildRoot -RequestedCudaArch $CudaArch -ReassertToolchainFromCache
+    Invoke-Checked cmake @profileArgs
+    Invoke-Checked cmake --build $BuildRoot --parallel 4
+    Invoke-Checked cmake --install $BuildRoot --prefix $InstallRoot --config $Configuration
+}
 $gateManifest = @(Get-RuntimeGateManifest)
 $gateObservations = [ordered]@{}
 $gateResultsPath = Join-Path $EvidenceRoot 'gate-results.json'
@@ -2170,10 +2386,35 @@ if ((Test-GateObservationPassed inventory) -and (Test-GateObservationPassed sbom
     } catch { Set-GateObservation payload-closure FAIL $_.Exception.Message }
 }
 
+if (Test-GateObservationPassed payload-closure) {
+    try {
+        $installedPeFiles = @(Get-ChildItem -LiteralPath (Join-Path $InstallRoot 'bin') -File -Recurse |
+            Where-Object { $_.Extension -in @('.exe','.dll') } | Select-Object -ExpandProperty FullName)
+        if ($installedPeFiles.Count -eq 0) { throw 'No installed PE files were available for the prepackage privacy scan.' }
+        $prepackageInputs = @($installedPeFiles + @($BundleRoot))
+        $prepackagePrivacy = Test-PathPrivacyContract -LiteralPaths $prepackageInputs -PhysicalRoots $PrivatePathRoots `
+            -LeafPhysicalRoots $PrivatePathLeafRoots -UserProfile $env:USERPROFILE -UserName ([Environment]::UserName) `
+            -RelativeTo $(if ($Local) { [string]$NeutralMount.neutral_root } else { $WorkRoot })
+        [ordered]@{
+            schema='diagnotes-path-privacy-prepackage-v1'
+            status=if ($prepackagePrivacy.passed) { 'PASS' } else { 'FAIL' }
+            installed_pe_count=$installedPeFiles.Count
+            scanned_files=$prepackagePrivacy.scanned_files
+            violation_count=$prepackagePrivacy.violations.Count
+            violations=@($prepackagePrivacy.violations)
+            private_values_recorded=$false
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'path-privacy-prepackage.json') -Encoding utf8NoBOM
+        if (-not $prepackagePrivacy.passed) {
+            throw ('prepackage private marker categories: ' + (@($prepackagePrivacy.violations.category | Sort-Object -Unique) -join ','))
+        }
+        Set-GateObservation path-privacy-prepackage PASS 'all installed PE files and the exact staged payload contain zero private path markers'
+    } catch { Set-GateObservation path-privacy-prepackage FAIL $_.Exception.Message }
+}
+
 $zipPath = Join-Path $ArtifactsRoot "$zipStem.zip"
 $recheckRoot = $null
 $extractedClosure = $null
-if (Test-GateObservationPassed payload-closure) {
+if (Test-GateObservationPassed path-privacy-prepackage) {
     try {
         $preCompressionRecords = @(Get-RuntimeTreeRecords -Root $BundleRoot)
         $preCompressionClosure = Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $preCompressionRecords `
@@ -2196,6 +2437,28 @@ if (Test-GateObservationPassed payload-closure) {
         } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'zip-recheck.json') -Encoding utf8NoBOM
         Set-GateObservation zip-extraction PASS 'final ZIP and clean extraction preserve exact payload plus two detached-covered metadata files'
     } catch { Set-GateObservation zip-extraction FAIL $_.Exception.Message }
+}
+
+if (Test-GateObservationPassed zip-extraction) {
+    try {
+        $postPackagePrivacy = Test-PathPrivacyContract -LiteralPaths @($zipPath,$recheckRoot) -PhysicalRoots $PrivatePathRoots `
+            -LeafPhysicalRoots $PrivatePathLeafRoots -UserProfile $env:USERPROFILE -UserName ([Environment]::UserName) `
+            -RelativeTo $(if ($Local) { [string]$NeutralMount.neutral_root } else { $WorkRoot })
+        [ordered]@{
+            schema='diagnotes-path-privacy-postpackage-v1'
+            status=if ($postPackagePrivacy.passed) { 'PASS' } else { 'FAIL' }
+            scanned_files=$postPackagePrivacy.scanned_files
+            violation_count=$postPackagePrivacy.violations.Count
+            violations=@($postPackagePrivacy.violations)
+            zip_scanned_directly=$true
+            clean_extraction_scanned=$true
+            private_values_recorded=$false
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'path-privacy-postpackage.json') -Encoding utf8NoBOM
+        if (-not $postPackagePrivacy.passed) {
+            throw ('postpackage private marker categories: ' + (@($postPackagePrivacy.violations.category | Sort-Object -Unique) -join ','))
+        }
+        Set-GateObservation path-privacy PASS 'final ZIP bytes and its clean extraction contain zero private path markers'
+    } catch { Set-GateObservation path-privacy FAIL $_.Exception.Message }
 }
 
 $defenderScans = @()
@@ -2239,12 +2502,17 @@ if (Test-GateObservationPassed zip-extraction) {
 try {
     $privacyViolations = @(Get-EvidencePrivacyViolations -Root $EvidenceRoot)
     if ($privacyViolations.Count -ne 0) { throw ('unsanitized evidence: ' + ($privacyViolations -join ',')) }
-    Set-GateObservation privacy PASS 'sanitized evidence contains no private-root or credential markers'
+    $evidenceBytePrivacy = Test-PathPrivacyContract -LiteralPaths @($EvidenceRoot) -PhysicalRoots $PrivatePathRoots `
+        -LeafPhysicalRoots $PrivatePathLeafRoots -UserProfile $env:USERPROFILE -UserName ([Environment]::UserName) -RelativeTo $EvidenceRoot
+    if (-not $evidenceBytePrivacy.passed) {
+        throw ('evidence byte marker categories: ' + (@($evidenceBytePrivacy.violations.category | Sort-Object -Unique) -join ','))
+    }
+    Set-GateObservation privacy PASS 'sanitized evidence contains zero private path, username or credential markers in ASCII or UTF-16'
 } catch { Set-GateObservation privacy FAIL $_.Exception.Message }
 
 $internalPrerequisites = @(
     'source-patch','cache','vcpkg','compile-arguments-inspectable','crt','profile','legal','pe-closure',
-    'inventory','sbom','payload-closure','zip-extraction','defender-tree','defender-zip','privacy'
+    'inventory','sbom','payload-closure','path-privacy-prepackage','zip-extraction','defender-tree','defender-zip','path-privacy','privacy'
 )
 if (@($internalPrerequisites | Where-Object { -not (Test-GateObservationPassed $_) }).Count -eq 0) {
     Set-GateObservation candidate-bytes-ready PASS 'all internal candidate byte prerequisites passed'
@@ -2270,7 +2538,42 @@ $postBuildPrivacyViolations = @(Get-EvidencePrivacyViolations -Root $EvidenceRoo
 if ($postBuildPrivacyViolations.Count -ne 0) {
     throw ('Post-build evidence privacy contract failed: ' + ($postBuildPrivacyViolations -join ','))
 }
-$result | ConvertTo-Json -Depth 6
-} finally {
-    Restore-ProcessEnvironmentMap -Snapshot $processEnvironmentSnapshot
+$postBuildBytePrivacy = Test-PathPrivacyContract -LiteralPaths @($EvidenceRoot) -PhysicalRoots $PrivatePathRoots `
+    -LeafPhysicalRoots $PrivatePathLeafRoots -UserProfile $env:USERPROFILE -UserName ([Environment]::UserName) -RelativeTo $EvidenceRoot
+if (-not $postBuildBytePrivacy.passed) {
+    throw ('Post-build evidence byte privacy failed: ' + (@($postBuildBytePrivacy.violations.category | Sort-Object -Unique) -join ','))
 }
+$finalResultJson = $result | ConvertTo-Json -Depth 6
+} catch {
+    $primaryFailure = $_
+} finally {
+    $substUnmounted = -not $Local
+    $environmentRestored = $false
+    if ($Local -and $NeutralMount) {
+        try {
+            [void](Dismount-NeutralBuildRoot -Mount $NeutralMount)
+            $substUnmounted = $true
+        } catch { $cleanupFailures.Add('neutral-drive-unmount') }
+    }
+    try {
+        Restore-ProcessEnvironmentMap -Snapshot $processEnvironmentSnapshot
+        $environmentRestored = $true
+    } catch { $cleanupFailures.Add('environment-restoration') }
+    if ($Local -and $PhysicalEvidenceRoot -and (Test-Path -LiteralPath $PhysicalEvidenceRoot -PathType Container)) {
+        try {
+            [ordered]@{
+                schema='diagnotes-neutral-build-lifecycle-v1'
+                subst_unmounted=$substUnmounted
+                environment_restored=$environmentRestored
+                cleanup_failure_categories=@($cleanupFailures)
+                private_values_recorded=$false
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $PhysicalEvidenceRoot 'neutral-build-lifecycle.json') -Encoding utf8NoBOM
+        } catch { $cleanupFailures.Add('lifecycle-evidence') }
+    }
+}
+if ($primaryFailure) {
+    if ($cleanupFailures.Count -gt 0) { throw "Runtime build failed; cleanup failures: $($cleanupFailures -join ',')." }
+    throw $primaryFailure
+}
+if ($cleanupFailures.Count -gt 0) { throw "Runtime build cleanup failures: $($cleanupFailures -join ',')." }
+$finalResultJson

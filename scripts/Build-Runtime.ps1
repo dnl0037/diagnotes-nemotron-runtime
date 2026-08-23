@@ -61,8 +61,524 @@ function ConvertTo-SanitizedEvidenceText {
             )
         }
     }
+    $Content = $Content -replace '(?im)\b(authorization)\s*[:=]\s*[^\r\n]+', '$1=<redacted>'
+    $Content = $Content -replace '(?im)\b(bearer)\s+[^\s,\r\n]+', '$1 <redacted>'
+    $Content = $Content -replace '(?im)(["'']?(?:token|secret|password)["'']?\s*[:=]\s*)[^\r\n]+', '$1<redacted>'
+    $Content = $Content -replace '(?i)((?:https?://|/)[^\s?]+)\?[^\s#]+', '$1?<redacted-query>'
     return $Content
 }
+
+function New-UpstreamBuildArguments {
+    param(
+        [Parameter(Mandatory)][ValidateSet('cpu','cuda')][string]$RequestedBackend,
+        [Parameter(Mandatory)][string]$RequestedConfiguration,
+        [Parameter(Mandatory)][string]$RequestedBuildRoot,
+        [Parameter(Mandatory)][string]$RequestedTriplet,
+        [Parameter(Mandatory)][string]$RequestedCudaArch
+    )
+    $arguments = [ordered]@{
+        Backend = $RequestedBackend
+        Profile = 'asr'
+        Http = $true
+        Config = $RequestedConfiguration
+        BuildDir = $RequestedBuildRoot
+        VcpkgTriplet = $RequestedTriplet
+        Architecture = 'x64'
+        Compiler = 'msvc'
+        Jobs = 4
+    }
+    if ($RequestedBackend -eq 'cuda') {
+        $arguments['CudaArch'] = $RequestedCudaArch
+        $arguments['CublasShim'] = $true
+    }
+    return $arguments
+}
+
+function Test-RuntimeIdentityContract {
+    param(
+        [Parameter(Mandatory)][string]$ObservedSourceCommit,
+        [Parameter(Mandatory)][string]$ObservedPatchSha256,
+        [Parameter(Mandatory)][long]$ObservedPatchBytes,
+        [Parameter(Mandatory)][string]$ObservedVersion,
+        [Parameter(Mandatory)][string]$ObservedTriplet,
+        [Parameter(Mandatory)][string]$ObservedCudaArch,
+        [Parameter(Mandatory)][string]$ObservedVcpkgCommit
+    )
+    $errors = @()
+    if ($ObservedSourceCommit -cne '4f9676226f667d14608487df744f375db87127f8') { $errors += 'source commit' }
+    if ($ObservedPatchSha256 -cne '80370907878F346B16AD27933B1CF9109C0C204198702D5307CD4C6434D63E84') { $errors += 'patch SHA-256' }
+    if ($ObservedPatchBytes -ne 1793) { $errors += 'patch bytes' }
+    if ($ObservedVersion -cne 'nemo-speech-v0.1.0-diagnotes-lid.3') { $errors += 'identity' }
+    if ($ObservedTriplet -cne 'x64-windows-static-md') { $errors += 'triplet' }
+    if ($ObservedCudaArch -cne '75;80;86;89') { $errors += 'CUDA architecture matrix' }
+    if ($ObservedVcpkgCommit -cne '9e593bb18ea69cc5095e012465dcd675a822ed0d') { $errors += 'vcpkg commit' }
+    return [pscustomobject]@{ passed=$errors.Count -eq 0; errors=@($errors) }
+}
+
+function New-ProfileArguments {
+    param(
+        [Parameter(Mandatory)][ValidateSet('cpu','cuda')][string]$RequestedBackend,
+        [Parameter(Mandatory)][string]$RequestedSourceRoot,
+        [Parameter(Mandatory)][string]$RequestedBuildRoot,
+        [Parameter(Mandatory)][string]$RequestedCudaArch
+    )
+    $arguments = @(
+        '-S', $RequestedSourceRoot, '-B', $RequestedBuildRoot,
+        '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+        '-DNEMO_SPEECH_BUILD_ASR=ON',
+        '-DNEMO_SPEECH_BUILD_HTTP=ON',
+        '-DNEMO_SPEECH_BUILD_CLI=ON',
+        '-DNEMO_SPEECH_BUILD_DIAR=OFF',
+        '-DNEMO_SPEECH_BUILD_TTS=OFF',
+        '-DNEMO_SPEECH_BUILD_NMT=OFF',
+        '-DNEMO_SPEECH_WITH_NMT=OFF',
+        '-DNEMO_SPEECH_BUILD_MIC_CAPTURE=OFF',
+        '-DNEMO_SPEECH_BUILD_GRPC=OFF',
+        '-DNEMO_SPEECH_WITH_GRPC=OFF',
+        '-DNEMO_SPEECH_BUILD_TESTS=OFF',
+        '-DBUILD_TESTING=OFF',
+        '-DNEMO_SPEECH_BUILD_EXAMPLES=OFF',
+        '-DNEMO_SPEECH_BUILD_TOOLS=OFF'
+    )
+    if ($RequestedBackend -eq 'cuda') {
+        $arguments += @('-DGGML_CUDA=ON', '-DGGML_VULKAN=OFF', '-DNEMO_SPEECH_CUBLAS_SHIM=ON', "-DCMAKE_CUDA_ARCHITECTURES=$RequestedCudaArch")
+    } else {
+        $arguments += @('-DGGML_CUDA=OFF', '-DGGML_VULKAN=OFF', '-DNEMO_SPEECH_GGML_PATCHED=OFF')
+    }
+    return $arguments
+}
+
+function ConvertFrom-CMakeCacheText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $entries = [ordered]@{}
+    $errors = @()
+    $lines = [regex]::Split($Text, "`r`n|`n", [Text.RegularExpressions.RegexOptions]::None)
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($line.Contains("`r")) {
+            $errors += "line $($index + 1): bare CR is not permitted"
+            continue
+        }
+        if ($line -match '^[\t ]*$' -or $line -match '^[\t ]*(?:#|//)') { continue }
+        $match = [regex]::Match($line, '^(?<key>[^:=\t ]+):(?<type>[^=\t ]+)=(?<value>.*)$')
+        if (-not $match.Success) {
+            $errors += "line $($index + 1): malformed cache entry"
+            continue
+        }
+        $key = $match.Groups['key'].Value
+        if ($entries.Contains($key)) {
+            $errors += "line $($index + 1): duplicate key $key"
+            continue
+        }
+        $entries[$key] = [pscustomobject]@{
+            key = $key
+            type = $match.Groups['type'].Value
+            value = $match.Groups['value'].Value
+            line = $index + 1
+        }
+    }
+    return [pscustomobject]@{ entries=$entries; errors=@($errors); line_count=$lines.Count }
+}
+
+function Test-CMakeCacheContract {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][ValidateSet('cpu','cuda')][string]$RequestedBackend,
+        [Parameter(Mandatory)][string]$RequestedTriplet,
+        [Parameter(Mandatory)][string]$RequestedCudaArch
+    )
+    $parsed = ConvertFrom-CMakeCacheText -Text $Text
+    $errors = @($parsed.errors)
+    $expected = [ordered]@{
+        NEMO_SPEECH_BUILD_ASR = @('BOOL','ON')
+        NEMO_SPEECH_BUILD_HTTP = @('BOOL','ON')
+        NEMO_SPEECH_BUILD_CLI = @('BOOL','ON')
+        NEMO_SPEECH_BUILD_DIAR = @('BOOL','OFF')
+        NEMO_SPEECH_BUILD_TTS = @('BOOL','OFF')
+        NEMO_SPEECH_BUILD_NMT = @('BOOL','OFF')
+        NEMO_SPEECH_BUILD_MIC_CAPTURE = @('BOOL','OFF')
+        VCPKG_TARGET_TRIPLET = @('STRING',$RequestedTriplet)
+        CMAKE_EXPORT_COMPILE_COMMANDS = @('BOOL','ON')
+    }
+    if ($RequestedBackend -eq 'cuda') {
+        $expected['CMAKE_CUDA_ARCHITECTURES'] = @('STRING',$RequestedCudaArch)
+    }
+    foreach ($item in $expected.GetEnumerator()) {
+        if (-not $parsed.entries.Contains($item.Key)) {
+            $errors += "missing $($item.Key)"
+            continue
+        }
+        $entry = $parsed.entries[$item.Key]
+        if ($entry.type -cne $item.Value[0] -or $entry.value -cne $item.Value[1]) {
+            $errors += "invalid $($item.Key)"
+        }
+    }
+    foreach ($requiredPath in @(
+        @('CMAKE_TOOLCHAIN_FILE','FILEPATH','vcpkg.cmake'),
+        @('CMAKE_CXX_COMPILER','FILEPATH','cl.exe')
+    )) {
+        if (-not $parsed.entries.Contains($requiredPath[0])) {
+            $errors += "missing $($requiredPath[0])"
+            continue
+        }
+        $entry = $parsed.entries[$requiredPath[0]]
+        $leaf = [IO.Path]::GetFileName($entry.value.Replace('/','\'))
+        if ($entry.type -cne $requiredPath[1] -or $leaf -cne $requiredPath[2]) {
+            $errors += "invalid $($requiredPath[0])"
+        }
+    }
+    if ($parsed.entries.Contains('CMAKE_MSVC_RUNTIME_LIBRARY')) {
+        $runtimeEntry = $parsed.entries['CMAKE_MSVC_RUNTIME_LIBRARY']
+        if ($runtimeEntry.type -cne 'STRING' -or $runtimeEntry.value -cne 'MultiThreadedDLL') {
+            $errors += 'invalid CMAKE_MSVC_RUNTIME_LIBRARY'
+        }
+    }
+    return [pscustomobject]@{
+        passed = $errors.Count -eq 0
+        errors = @($errors)
+        entries = $parsed.entries
+    }
+}
+
+function ConvertFrom-CMakeSetText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $entries = [ordered]@{}
+    $errors = @()
+    $lines = [regex]::Split($Text, "`r`n|`n", [Text.RegularExpressions.RegexOptions]::None)
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($line.Contains("`r")) { $errors += "line $($index + 1): bare CR"; continue }
+        if ($line -match '^[\t ]*$' -or $line -match '^[\t ]*#') { continue }
+        $match = [regex]::Match($line, '^[\t ]*set\([\t ]*(?<key>[A-Za-z0-9_]+)[\t ]+(?<value>[^\s\)]+)[\t ]*\)[\t ]*$')
+        if (-not $match.Success) { continue }
+        $key = $match.Groups['key'].Value
+        if ($entries.Contains($key)) { $errors += "line $($index + 1): duplicate key $key"; continue }
+        $entries[$key] = $match.Groups['value'].Value
+    }
+    return [pscustomobject]@{ entries=$entries; errors=@($errors) }
+}
+
+function ConvertFrom-ExactKeyValueText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $entries = [ordered]@{}
+    $errors = @()
+    $lines = [regex]::Split($Text, "`r`n|`n", [Text.RegularExpressions.RegexOptions]::None)
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($line.Contains("`r")) { $errors += "line $($index + 1): bare CR"; continue }
+        if ($line.Length -eq 0) { continue }
+        $match = [regex]::Match($line, '^(?<key>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.+)$')
+        if (-not $match.Success) { $errors += "line $($index + 1): malformed key/value"; continue }
+        $key = $match.Groups['key'].Value
+        if ($entries.Contains($key)) { $errors += "line $($index + 1): duplicate key $key"; continue }
+        $entries[$key] = $match.Groups['value'].Value
+    }
+    return [pscustomobject]@{ entries=$entries; errors=@($errors) }
+}
+
+function Test-CudaVersionJson {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+    try {
+        $document = $Json | ConvertFrom-Json -Depth 20 -ErrorAction Stop
+    } catch {
+        return [pscustomobject]@{ passed=$false; reason='invalid JSON' }
+    }
+    if ($null -eq $document.cuda -or [string]$document.cuda.name -cne 'CUDA SDK' -or
+        [string]$document.cuda.version -cne '12.8.0') {
+        return [pscustomobject]@{ passed=$false; reason='cuda identity/version mismatch' }
+    }
+    return [pscustomobject]@{ passed=$true; reason='CUDA SDK 12.8.0' }
+}
+
+function Test-NvccVersionText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $lines = @([regex]::Split($Text, "`r`n|`n", [Text.RegularExpressions.RegexOptions]::None) | Where-Object { $_.Length -gt 0 })
+    if (@($lines | Where-Object { $_.Contains("`r") }).Count -ne 0) {
+        return [pscustomobject]@{ passed=$false; reason='bare CR' }
+    }
+    $semantic = @($lines | Where-Object { $_ -match '^Cuda compilation tools, release (?<release>[0-9]+\.[0-9]+), V(?<version>[0-9]+\.[0-9]+\.[0-9]+)$' })
+    if ($semantic.Count -ne 1) { return [pscustomobject]@{ passed=$false; reason='ambiguous semantic version line' } }
+    $match = [regex]::Match($semantic[0], '^Cuda compilation tools, release (?<release>[0-9]+\.[0-9]+), V(?<version>[0-9]+\.[0-9]+\.[0-9]+)$')
+    if ($match.Groups['release'].Value -cne '12.8' -or -not $match.Groups['version'].Value.StartsWith('12.8.', [StringComparison]::Ordinal)) {
+        return [pscustomobject]@{ passed=$false; reason='nvcc version mismatch' }
+    }
+    return [pscustomobject]@{ passed=$true; reason=$semantic[0] }
+}
+
+function Test-MicrosoftSignerIdentity {
+    param(
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Subject
+    )
+    if ($Status -cne 'Valid') { return $false }
+    $fields = [ordered]@{}
+    foreach ($part in @($Subject -split ',[ ]*')) {
+        $match = [regex]::Match($part, '^(?<key>CN|O|L|S|C)=(?<value>[^,]+)$')
+        if (-not $match.Success) { return $false }
+        $key = $match.Groups['key'].Value
+        if ($fields.Contains($key)) { return $false }
+        $fields[$key] = $match.Groups['value'].Value
+    }
+    return $fields.Contains('O') -and $fields['O'] -ceq 'Microsoft Corporation'
+}
+
+function ConvertFrom-DumpbinDependentsText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $lines = [regex]::Split($Text, "`r`n|`n", [Text.RegularExpressions.RegexOptions]::None)
+    if (@($lines | Where-Object { $_.Contains("`r") }).Count -ne 0) {
+        return [pscustomobject]@{ passed=$false; dependencies=@(); reason='bare CR' }
+    }
+    $headerIndexes = @()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -ceq '  Image has the following dependencies:') { $headerIndexes += $index }
+    }
+    if ($headerIndexes.Count -ne 1) {
+        return [pscustomobject]@{ passed=$false; dependencies=@(); reason='dependency section cardinality' }
+    }
+    $dependencies = @()
+    $started = $false
+    for ($index = $headerIndexes[0] + 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($line.Length -eq 0) {
+            if ($started) { break }
+            continue
+        }
+        $match = [regex]::Match($line, '^    (?<name>[A-Za-z0-9_.-]+\.dll)$')
+        if (-not $match.Success) {
+            return [pscustomobject]@{ passed=$false; dependencies=@(); reason='unrecognized dependency line' }
+        }
+        $started = $true
+        $dependencies += $match.Groups['name'].Value
+    }
+    if ($dependencies.Count -eq 0 -or @($dependencies | Sort-Object -Unique).Count -ne $dependencies.Count) {
+        return [pscustomobject]@{ passed=$false; dependencies=@(); reason='empty or duplicate dependency set' }
+    }
+    return [pscustomobject]@{ passed=$true; dependencies=@($dependencies); reason='strict dumpbin dependency section' }
+}
+
+function Get-RuntimeFileClassification {
+    param([Parameter(Mandatory)][string]$RelativePath)
+    $path = $RelativePath.Replace('\','/')
+    $rules = @(
+        [pscustomobject]@{ pattern='^bin/(?i:(?:msvcp|vcruntime|concrt|vccorlib)140(?:_[0-9A-Za-z]+)?\.dll)$'; origin='Microsoft Visual C++ Redist from effective MSVC toolchain'; license='LicenseRef-Microsoft-Visual-Cpp-Runtime' },
+        [pscustomobject]@{ pattern='^bin/ggml(?:-[A-Za-z0-9_-]+)?\.dll$'; origin='ggml'; license='MIT' },
+        [pscustomobject]@{ pattern='^bin/(?:cublas|cublasLt|cudart)64_12\.dll$'; origin='NeMo-Speech.cpp CUDA shim + CUDA runtime'; license='Apache-2.0 AND LicenseRef-NVIDIA-CUDA-Toolkit' },
+        [pscustomobject]@{ pattern='^bin/nemo-speech\.exe$'; origin='NeMo-Speech.cpp distribution'; license='Apache-2.0' },
+        [pscustomobject]@{ pattern='^(?:LICENSE|NOTICE|realtime-language-v1\.patch|runtime-build\.json|inventory\.json|sbom\.spdx\.json|msvc-redist-inventory\.json|pe-imports\.json)$'; origin='DiagNotes runtime recipe'; license='Apache-2.0' },
+        [pscustomobject]@{ pattern='^share/licenses/microsoft-visual-cpp-runtime/(?:Visual-Studio-2022-Community-License-EN\.docx|Visual-Studio-2022-Redistribution\.html|Redist\.txt)$'; origin='Microsoft official license/REDIST evidence'; license='LicenseRef-Microsoft-Visual-Studio-2022' },
+        [pscustomobject]@{ pattern='^share/licenses/nvidia-cuda-toolkit/EULA\.txt$'; origin='NVIDIA CUDA Toolkit'; license='LicenseRef-NVIDIA-CUDA-Toolkit' },
+        [pscustomobject]@{ pattern='^share/licenses/cpp-httplib/.+$'; origin='cpp-httplib'; license='MIT' },
+        [pscustomobject]@{ pattern='^share/licenses/sentencepiece/.+$'; origin='sentencepiece'; license='Apache-2.0' },
+        [pscustomobject]@{ pattern='^share/licenses/nemo-speech/.+$'; origin='NeMo-Speech.cpp distribution'; license='Apache-2.0' }
+    )
+    $matches = @($rules | Where-Object { $path -match $_.pattern })
+    if ($matches.Count -ne 1) { return [pscustomobject]@{ passed=$false; reason="classification cardinality $($matches.Count)" } }
+    return [pscustomobject]@{ passed=$true; origin=$matches[0].origin; license=$matches[0].license }
+}
+
+function Test-RuntimeBinaryProfile {
+    param(
+        [Parameter(Mandatory)][string[]]$Names,
+        [Parameter(Mandatory)][ValidateSet('cpu','cuda')][string]$RequestedBackend
+    )
+    $errors = @()
+    if ($Names -notcontains 'nemo-speech.exe') { $errors += 'nemo-speech.exe missing' }
+    if ($RequestedBackend -eq 'cuda' -and $Names -notcontains 'ggml-cuda.dll') { $errors += 'ggml-cuda.dll missing' }
+    if ($RequestedBackend -eq 'cpu' -and $Names -contains 'ggml-cuda.dll') { $errors += 'CPU contains ggml-cuda.dll' }
+    if ($Names -contains 'nvcuda.dll') { $errors += 'host driver redistributed' }
+    foreach ($name in $Names) {
+        $classification = Get-RuntimeFileClassification -RelativePath "bin/$name"
+        if (-not $classification.passed) { $errors += "unclassified binary $name" }
+    }
+    return [pscustomobject]@{ passed=$errors.Count -eq 0; errors=@($errors) }
+}
+
+function ConvertFrom-WindowsCommandLine {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$CommandLine)
+    $arguments = [Collections.Generic.List[string]]::new()
+    $builder = [Text.StringBuilder]::new()
+    $quoted = $false
+    $argumentStarted = $false
+    $backslashes = 0
+    for ($index = 0; $index -lt $CommandLine.Length; $index++) {
+        $character = $CommandLine[$index]
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            if ($backslashes -gt 0) {
+                [void]$builder.Append(('\' * [math]::Floor($backslashes / 2)))
+                if (($backslashes % 2) -eq 1) {
+                    [void]$builder.Append('"')
+                    $argumentStarted = $true
+                } else {
+                    $quoted = -not $quoted
+                    $argumentStarted = $true
+                }
+                $backslashes = 0
+                continue
+            }
+            $quoted = -not $quoted
+            $argumentStarted = $true
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append(('\' * $backslashes))
+            $backslashes = 0
+            $argumentStarted = $true
+        }
+        if ([char]::IsWhiteSpace($character) -and -not $quoted) {
+            if ($argumentStarted) {
+                $arguments.Add($builder.ToString())
+                [void]$builder.Clear()
+                $argumentStarted = $false
+            }
+            continue
+        }
+        [void]$builder.Append($character)
+        $argumentStarted = $true
+    }
+    if ($backslashes -gt 0) { [void]$builder.Append(('\' * $backslashes)); $argumentStarted = $true }
+    if ($quoted) { throw 'Unterminated quoted argument.' }
+    if ($argumentStarted) { $arguments.Add($builder.ToString()) }
+    return ,$arguments.ToArray()
+}
+
+function Test-CompileCommandsContract {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+    $errors = @()
+    $opaque = $false
+    try {
+        $decoded = $Json | ConvertFrom-Json -Depth 20 -NoEnumerate -ErrorAction Stop
+        $entries = @($decoded)
+    } catch {
+        return [pscustomobject]@{ passed=$false; inspectable=$false; count=0; errors=@('invalid JSON'); sanitized_commands=@() }
+    }
+    if ($entries.Count -eq 0) {
+        return [pscustomobject]@{ passed=$false; inspectable=$false; count=0; errors=@('zero entries'); sanitized_commands=@() }
+    }
+    $summaries = @()
+    for ($index = 0; $index -lt $entries.Count; $index++) {
+        $entry = $entries[$index]
+        $hasArguments = $null -ne $entry.PSObject.Properties['arguments']
+        $hasCommand = $null -ne $entry.PSObject.Properties['command']
+        if ($hasArguments -eq $hasCommand) {
+            $errors += "entry $index must contain exactly one command representation"
+            continue
+        }
+        try {
+            $arguments = if ($hasArguments) { @($entry.arguments | ForEach-Object { [string]$_ }) }
+                else { @(ConvertFrom-WindowsCommandLine -CommandLine ([string]$entry.command)) }
+        } catch {
+            $errors += "entry $index command line is invalid"
+            continue
+        }
+        if ($arguments.Count -eq 0 -or [string]::IsNullOrWhiteSpace($arguments[0])) {
+            $errors += "entry $index is empty"
+            continue
+        }
+        if (@($arguments | Where-Object { $_ -match '^@' }).Count -gt 0) {
+            $errors += "entry $index uses opaque response arguments"
+            $opaque = $true
+            continue
+        }
+        $compiler = [IO.Path]::GetFileName($arguments[0].Replace('/','\')).ToLowerInvariant()
+        if ($compiler -notin @('cl','cl.exe','nvcc','nvcc.exe')) {
+            $errors += "entry $index has non-compiler command"
+            continue
+        }
+        $isNvcc = $compiler -in @('nvcc','nvcc.exe')
+        $compileToken = if ($isNvcc) { '-c' } else { '/c' }
+        if ($arguments -cnotcontains $compileToken) {
+            $errors += "entry $index lacks compile action"
+            continue
+        }
+        $forwarded = [Collections.Generic.List[string]]::new()
+        for ($argIndex = 1; $argIndex -lt $arguments.Count; $argIndex++) {
+            $argument = $arguments[$argIndex]
+            if ($argument -in @('-Xcompiler','--compiler-options')) {
+                if ($argIndex + 1 -ge $arguments.Count) { $errors += "entry $index has incomplete compiler forwarding"; continue }
+                $argIndex++
+                @($arguments[$argIndex] -split ',') | ForEach-Object { $forwarded.Add($_) }
+            } elseif ($argument -match '^(?:-Xcompiler|--compiler-options)=(.+)$') {
+                @($Matches[1] -split ',') | ForEach-Object { $forwarded.Add($_) }
+            }
+        }
+        $crtArguments = if ($isNvcc) { @($arguments + $forwarded.ToArray()) } else { $arguments }
+        $forbidden = @($crtArguments | Where-Object { $_ -in @('/MT','/MTd','/MDd') })
+        $hasMd = $crtArguments -contains '/MD'
+        if ($forbidden.Count -gt 0) { $errors += "entry $index contains forbidden CRT flag" }
+        if (-not $hasMd) { $errors += "entry $index lacks /MD" }
+        $summaries += [pscustomobject]@{ index=$index; compiler=$compiler; argument_count=$arguments.Count; has_md=$hasMd; forbidden_count=$forbidden.Count }
+    }
+    return [pscustomobject]@{
+        passed = $errors.Count -eq 0
+        inspectable = -not $opaque
+        count = $entries.Count
+        errors = @($errors)
+        sanitized_commands = @($summaries)
+    }
+}
+
+function Get-RuntimeGateManifest {
+    return @(
+        [pscustomobject]@{ id='source-patch'; dependencies=@() },
+        [pscustomobject]@{ id='cache'; dependencies=@() },
+        [pscustomobject]@{ id='vcpkg'; dependencies=@('cache') },
+        [pscustomobject]@{ id='compile-arguments-inspectable'; dependencies=@() },
+        [pscustomobject]@{ id='crt'; dependencies=@('compile-arguments-inspectable') },
+        [pscustomobject]@{ id='profile'; dependencies=@() },
+        [pscustomobject]@{ id='legal'; dependencies=@('cache') },
+        [pscustomobject]@{ id='pe-closure'; dependencies=@('cache','legal') },
+        [pscustomobject]@{ id='inventory'; dependencies=@('profile','legal','pe-closure') },
+        [pscustomobject]@{ id='sbom'; dependencies=@('inventory') },
+        [pscustomobject]@{ id='zip-extraction'; dependencies=@('inventory','sbom') },
+        [pscustomobject]@{ id='defender-tree'; dependencies=@('zip-extraction') },
+        [pscustomobject]@{ id='defender-zip'; dependencies=@('zip-extraction') },
+        [pscustomobject]@{ id='privacy'; dependencies=@() },
+        [pscustomobject]@{ id='candidate-bytes-ready'; dependencies=@('source-patch','cache','vcpkg','crt','profile','legal','pe-closure','inventory','sbom','zip-extraction','defender-tree','defender-zip','privacy') },
+        [pscustomobject]@{ id='attestation-created'; dependencies=@('candidate-bytes-ready') },
+        [pscustomobject]@{ id='attestation-digest-verified'; dependencies=@('attestation-created') },
+        [pscustomobject]@{ id='candidate-upload-eligible'; dependencies=@('attestation-digest-verified') }
+    )
+}
+
+function Invoke-RuntimeGateGraph {
+    param(
+        [Parameter(Mandatory)][object[]]$Manifest,
+        [Parameter(Mandatory)][Collections.IDictionary]$Observations
+    )
+    $known = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($gate in $Manifest) {
+        if (-not $known.Add([string]$gate.id)) { throw "Duplicate gate id: $($gate.id)" }
+        foreach ($dependency in @($gate.dependencies)) {
+            if (-not $known.Contains([string]$dependency)) { throw "Unknown or forward dependency: $dependency" }
+        }
+    }
+    $results = [ordered]@{}
+    foreach ($gate in $Manifest) {
+        $blockedBy = @($gate.dependencies | Where-Object { $results[$_].status -ne 'PASS' })
+        if ($blockedBy.Count -gt 0) {
+            $results[$gate.id] = [pscustomobject]@{ id=$gate.id; status='BLOCKED'; reason=('dependencies: ' + ($blockedBy -join ',')); dependencies=@($gate.dependencies) }
+            continue
+        }
+        if (-not $Observations.Contains($gate.id)) {
+            $results[$gate.id] = [pscustomobject]@{ id=$gate.id; status='BLOCKED'; reason='not observed'; dependencies=@($gate.dependencies) }
+            continue
+        }
+        $observation = $Observations[$gate.id]
+        $status = [string]$observation.status
+        if ($status -notin @('PASS','FAIL')) { throw "Invalid observed status for $($gate.id): $status" }
+        $results[$gate.id] = [pscustomobject]@{ id=$gate.id; status=$status; reason=[string]$observation.reason; dependencies=@($gate.dependencies) }
+    }
+    return @($results.Values)
+}
+
+$identityContract = Test-RuntimeIdentityContract -ObservedSourceCommit $SourceCommit -ObservedPatchSha256 $PatchSha256 `
+    -ObservedPatchBytes $PatchBytes -ObservedVersion $Version -ObservedTriplet $VcpkgTriplet `
+    -ObservedCudaArch $CudaArch -ObservedVcpkgCommit $ExpectedVcpkgCommit
+if (-not $identityContract.passed) { throw "Runtime identity contract failed: $($identityContract.errors -join ', ')" }
 
 if ($Backend -eq 'cpu' -and $CudaArch -ne '75;80;86;89') {
     throw 'CudaArch is immutable even when the CPU job ignores it.'
@@ -319,7 +835,8 @@ if ($Backend -eq 'cuda') {
             $cudaVersionMetadata = Join-Path $cudaRoot 'version.json'
             if (-not (Test-Path -LiteralPath $cudaVersionMetadata)) { throw 'CUDA 12.8 native version.json metadata is missing.' }
             $cudaVersionRaw = Get-Content -LiteralPath $cudaVersionMetadata -Raw
-            if ($cudaVersionRaw -notmatch '12\.8') { throw 'CUDA native version metadata does not identify 12.8.' }
+            $cudaVersionContract = Test-CudaVersionJson -Json $cudaVersionRaw
+            if (-not $cudaVersionContract.passed) { throw "CUDA native version metadata failed: $($cudaVersionContract.reason)" }
             [ordered]@{
                 schema='diagnotes-cuda-component-inventory-v1'; toolkit='12.8'
                 version_json_sha256=(Get-FileHash -LiteralPath $cudaVersionMetadata -Algorithm SHA256).Hash
@@ -335,7 +852,13 @@ if ($Backend -eq 'cuda') {
             $env:CUDA_PATH_V12_8 = $cudaRoot
             $env:Path = "$cudaRoot\bin;$env:Path"
             $nvccVersion = (& "$cudaRoot\bin\nvcc.exe" --version 2>&1 | Out-String)
-            $nvccVersionIs128 = $nvccVersion -match 'release 12\.8'
+            [IO.File]::WriteAllText(
+                (Join-Path $EvidenceRoot 'nvcc-version.sanitized.txt'),
+                (ConvertTo-SanitizedEvidenceText -Content $nvccVersion),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $nvccVersionContract = Test-NvccVersionText -Text $nvccVersion
+            $nvccVersionIs128 = $nvccVersionContract.passed
             if (-not $nvccVersionIs128) { throw 'nvcc does not report release 12.8.' }
         }
         $postGateStage = 'complete'
@@ -398,199 +921,192 @@ if ($Backend -eq 'cuda') {
 }
 
 $upstreamBuild = Join-Path $SourceRoot 'scripts\windows\build.ps1'
-$buildArgs = @{
-    Backend = $Backend
-    Profile = 'asr'
-    Http = $true
-    Config = $Configuration
-    BuildDir = $BuildRoot
-    VcpkgTriplet = $VcpkgTriplet
-    Architecture = 'x64'
-    Compiler = 'msvc'
-    Jobs = 4
-}
-if ($Backend -eq 'cuda') {
-    $buildArgs['CudaArch'] = $CudaArch
-    $buildArgs['CublasShim'] = $true
-}
+$buildArgs = New-UpstreamBuildArguments -RequestedBackend $Backend -RequestedConfiguration $Configuration `
+    -RequestedBuildRoot $BuildRoot -RequestedTriplet $VcpkgTriplet -RequestedCudaArch $CudaArch
 # Run upstream in-process so its vcvars64 import remains available for the
 # contracted ASR+HTTP-only reconfigure below. A child pwsh discards INCLUDE,
 # LIB, and LIBPATH on exit and makes the otherwise valid MSVC build non-repeatable.
 & $upstreamBuild @buildArgs
 
 # Reconfigure the upstream ASR preset to the contracted ASR+HTTP-only surface.
-$profileArgs = @(
-    '-S', $SourceRoot, '-B', $BuildRoot,
-    '-DNEMO_SPEECH_BUILD_ASR=ON',
-    '-DNEMO_SPEECH_BUILD_HTTP=ON',
-    '-DNEMO_SPEECH_BUILD_CLI=ON',
-    '-DNEMO_SPEECH_BUILD_DIAR=OFF',
-    '-DNEMO_SPEECH_BUILD_TTS=OFF',
-    '-DNEMO_SPEECH_BUILD_NMT=OFF',
-    '-DNEMO_SPEECH_WITH_NMT=OFF',
-    '-DNEMO_SPEECH_BUILD_MIC_CAPTURE=OFF',
-    '-DNEMO_SPEECH_BUILD_GRPC=OFF',
-    '-DNEMO_SPEECH_WITH_GRPC=OFF',
-    '-DNEMO_SPEECH_BUILD_TESTS=OFF',
-    '-DBUILD_TESTING=OFF',
-    '-DNEMO_SPEECH_BUILD_EXAMPLES=OFF',
-    '-DNEMO_SPEECH_BUILD_TOOLS=OFF'
-)
-if ($Backend -eq 'cuda') {
-    $profileArgs += @('-DGGML_CUDA=ON', '-DGGML_VULKAN=OFF', '-DNEMO_SPEECH_CUBLAS_SHIM=ON', "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch")
-} else {
-    $profileArgs += @('-DGGML_CUDA=OFF', '-DGGML_VULKAN=OFF', '-DNEMO_SPEECH_GGML_PATCHED=OFF')
-}
+$profileArgs = New-ProfileArguments -RequestedBackend $Backend -RequestedSourceRoot $SourceRoot `
+    -RequestedBuildRoot $BuildRoot -RequestedCudaArch $CudaArch
 Invoke-Checked cmake @profileArgs
 Invoke-Checked cmake --build $BuildRoot --parallel 4
 Invoke-Checked cmake --install $BuildRoot --prefix $InstallRoot --config $Configuration
+$gateManifest = @(Get-RuntimeGateManifest)
+$gateObservations = [ordered]@{}
+$gateResultsPath = Join-Path $EvidenceRoot 'gate-results.json'
 
-$cache = Get-Content -LiteralPath (Join-Path $BuildRoot 'CMakeCache.txt') -Raw
-$requiredCache = @(
-    'NEMO_SPEECH_BUILD_ASR:BOOL=ON', 'NEMO_SPEECH_BUILD_HTTP:BOOL=ON',
-    'NEMO_SPEECH_BUILD_CLI:BOOL=ON', 'NEMO_SPEECH_BUILD_DIAR:BOOL=OFF',
-    'NEMO_SPEECH_BUILD_TTS:BOOL=OFF', 'NEMO_SPEECH_BUILD_NMT:BOOL=OFF',
-    'NEMO_SPEECH_BUILD_MIC_CAPTURE:BOOL=OFF'
-)
-foreach ($entry in $requiredCache) { if ($cache -notmatch [regex]::Escape($entry)) { throw "CMake cache lacks $entry" } }
-if ($cache -match 'CMAKE_CUDA_ARCHITECTURES:[^=]*=(native|86)$') { throw 'CUDA architecture cache is incomplete or native.' }
-$tripletCandidatePattern = '(?:\A|(?<=[\r\n]))[ \t]*VCPKG_TARGET_TRIPLET(?=[^A-Za-z0-9_]|\z)'
-$tripletExactPattern = "(?:\A|(?<=\n))VCPKG_TARGET_TRIPLET:STRING=$([regex]::Escape($VcpkgTriplet))(?:\r?\n|\z)"
-$tripletCandidateCount = [regex]::Matches($cache, $tripletCandidatePattern).Count
-$tripletExactCount = [regex]::Matches($cache, $tripletExactPattern).Count
-if ($tripletCandidateCount -ne 1 -or $tripletExactCount -ne 1) {
-    throw 'CMake cache does not prove the required x64-windows-static-md triplet.'
-}
-if ($cache -match '(?m)^CMAKE_MSVC_RUNTIME_LIBRARY:[^=]+=MultiThreaded$') {
-    throw 'CMake cache contains the forbidden static MSVC runtime policy.'
+function Set-GateObservation {
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][ValidateSet('PASS','FAIL')][string]$Status, [Parameter(Mandatory)][string]$Reason)
+    $script:gateObservations[$Id] = [pscustomobject]@{ status=$Status; reason=(ConvertTo-SanitizedEvidenceText -Content $Reason) }
 }
 
-$toolchainMatch = [regex]::Match($cache, '(?m)^CMAKE_TOOLCHAIN_FILE:[^=]+=(.+)$')
-if (-not $toolchainMatch.Success) { throw 'CMake cache does not identify the vcpkg toolchain.' }
-$vcpkgToolchain = $toolchainMatch.Groups[1].Value.Trim()
-$vcpkgRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $vcpkgToolchain))
-$tripletPath = Join-Path $vcpkgRoot "triplets\$VcpkgTriplet.cmake"
-if (-not (Test-Path -LiteralPath $tripletPath)) { throw 'Pinned vcpkg triplet file is missing.' }
-$tripletText = Get-Content -LiteralPath $tripletPath -Raw
-if ($tripletText -notmatch 'set\s*\(\s*VCPKG_LIBRARY_LINKAGE\s+static\s*\)' -or
-    $tripletText -notmatch 'set\s*\(\s*VCPKG_CRT_LINKAGE\s+dynamic\s*\)') {
-    throw 'vcpkg triplet does not declare static libraries with dynamic CRT.'
-}
-$vcpkgHead = (git -C $vcpkgRoot rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $vcpkgHead -ne $ExpectedVcpkgCommit) {
-    throw 'Effective vcpkg checkout does not match the pinned commit.'
+function Test-GateObservationPassed {
+    param([Parameter(Mandatory)][string]$Id)
+    return $gateObservations.Contains($Id) -and $gateObservations[$Id].status -eq 'PASS'
 }
 
-$ninjaCommandsRaw = (& ninja -C $BuildRoot -t commands 2>&1 | Out-String)
-if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect effective Ninja commands.' }
-$compileCommands = @($ninjaCommandsRaw -split "`r?`n" | Where-Object {
-    $_ -match '(?i)(?:cl(?:\.exe)?|nvcc(?:\.exe)?).*(?:/c|-c)'
-})
-if ($compileCommands.Count -eq 0) { throw 'No effective C/CUDA compilation commands were observed.' }
-foreach ($command in $compileCommands) {
-    if ($command -match '(?i)(?<!\S)/MTd?(?!\S)' -or $command -match '(?i)(?<!\S)/MDd(?!\S)') {
-        throw 'Effective compile command contains a forbidden or debug CRT flag.'
+function Write-GateResults {
+    $gateResults = @(Invoke-RuntimeGateGraph -Manifest $gateManifest -Observations $gateObservations)
+    $payload = [ordered]@{
+        schema='diagnotes-runtime-gates-v1'; backend=$Backend; source_commit=$SourceCommit
+        recipe_commit=$env:GITHUB_SHA; stage='candidate-bytes'; gates=$gateResults
     }
-    if ($command -notmatch '(?i)(?:^|[=\s"''])/MD(?:$|[\s"''])') {
-        throw 'Effective Release compile command does not prove dynamic MSVC CRT (/MD).'
-    }
+    $json = $payload | ConvertTo-Json -Depth 8
+    $temporaryPath = Join-Path $EvidenceRoot ('gate-results.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporaryPath -Destination $gateResultsPath -Force
+    return $payload
 }
-$sanitizedNinjaCommands = ConvertTo-SanitizedEvidenceText -Content $ninjaCommandsRaw
-[IO.File]::WriteAllText(
-    (Join-Path $EvidenceRoot 'ninja-commands.sanitized.txt'),
-    $sanitizedNinjaCommands,
-    [Text.UTF8Encoding]::new($false)
-)
-$crtEvidence = [ordered]@{
-    schema='diagnotes-crt-coherence-v1'
-    vcpkg_commit=$vcpkgHead
-    triplet=$VcpkgTriplet
-    triplet_sha256=(Get-FileHash -LiteralPath $tripletPath -Algorithm SHA256).Hash
-    library_linkage='static'
-    crt_linkage='dynamic'
-    compile_command_count=$compileCommands.Count
-    release_flag='/MD'
-    forbidden_flags_absent=$true
-    linker_negatives_absent=@('LNK2038','LNK2005','LNK1169')
-}
-$crtEvidence | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'crt-coherence.json') -Encoding utf8NoBOM
 
-$zipStem = if ($Backend -eq 'cpu') {
-    "$Version-windows-x86_64-cpu"
-} else {
-    "$Version-windows-x86_64-cuda-sm75-sm80-sm86-sm89"
+try {
+    $functionalDiff = (git -C $SourceRoot diff --binary | Out-String)
+    [IO.File]::WriteAllText((Join-Path $EvidenceRoot 'functional.diff'), (ConvertTo-SanitizedEvidenceText -Content $functionalDiff), [Text.UTF8Encoding]::new($false))
+    Set-GateObservation source-patch PASS 'source, patch, allowlist and two hunks verified before build'
+} catch { Set-GateObservation source-patch FAIL $_.Exception.Message }
+
+$cacheContract = $null
+$cache = $null
+try {
+    $cache = [IO.File]::ReadAllText((Join-Path $BuildRoot 'CMakeCache.txt'))
+    [IO.File]::WriteAllText((Join-Path $EvidenceRoot 'CMakeCache.sanitized.txt'), (ConvertTo-SanitizedEvidenceText -Content $cache), [Text.UTF8Encoding]::new($false))
+    $cacheContract = Test-CMakeCacheContract -Text $cache -RequestedBackend $Backend -RequestedTriplet $VcpkgTriplet -RequestedCudaArch $CudaArch
+    if (-not $cacheContract.passed) { throw ($cacheContract.errors -join '; ') }
+    Set-GateObservation cache PASS 'structured CMake cache contract passed'
+} catch { Set-GateObservation cache FAIL $_.Exception.Message }
+
+$vcpkgRoot = $null
+$tripletPath = $null
+$vcpkgHead = $null
+if (Test-GateObservationPassed cache) {
+    try {
+        $vcpkgToolchain = $cacheContract.entries['CMAKE_TOOLCHAIN_FILE'].value
+        $vcpkgRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $vcpkgToolchain))
+        $tripletPath = Join-Path $vcpkgRoot "triplets\$VcpkgTriplet.cmake"
+        if (-not (Test-Path -LiteralPath $tripletPath -PathType Leaf)) { throw 'Pinned vcpkg triplet file is missing.' }
+        $tripletContract = ConvertFrom-CMakeSetText -Text ([IO.File]::ReadAllText($tripletPath))
+        if ($tripletContract.errors.Count -ne 0 -or -not $tripletContract.entries.Contains('VCPKG_LIBRARY_LINKAGE') -or
+            -not $tripletContract.entries.Contains('VCPKG_CRT_LINKAGE') -or $tripletContract.entries['VCPKG_LIBRARY_LINKAGE'] -cne 'static' -or
+            $tripletContract.entries['VCPKG_CRT_LINKAGE'] -cne 'dynamic') { throw 'vcpkg triplet does not declare static libraries with dynamic CRT.' }
+        $vcpkgHead = (git -C $vcpkgRoot rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or $vcpkgHead -cne $ExpectedVcpkgCommit) { throw 'Effective vcpkg checkout differs from its pin.' }
+        [ordered]@{ schema='diagnotes-vcpkg-v1'; commit=$vcpkgHead; triplet=$VcpkgTriplet; triplet_sha256=(Get-FileHash -LiteralPath $tripletPath -Algorithm SHA256).Hash; library_linkage='static'; crt_linkage='dynamic' } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'vcpkg.json') -Encoding utf8NoBOM
+        Set-GateObservation vcpkg PASS 'vcpkg pin and structural triplet contract passed'
+    } catch { Set-GateObservation vcpkg FAIL $_.Exception.Message }
 }
+
+$compileContract = $null
+try {
+    $compileDatabasePath = Join-Path $BuildRoot 'compile_commands.json'
+    if (-not (Test-Path -LiteralPath $compileDatabasePath -PathType Leaf)) { throw 'compile_commands.json is missing.' }
+    $compileDatabaseRaw = [IO.File]::ReadAllText($compileDatabasePath)
+    [IO.File]::WriteAllText((Join-Path $EvidenceRoot 'compile-commands.sanitized.json'), (ConvertTo-SanitizedEvidenceText -Content $compileDatabaseRaw), [Text.UTF8Encoding]::new($false))
+    $compileContract = Test-CompileCommandsContract -Json $compileDatabaseRaw
+    $compileContract.sanitized_commands | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'compile-command-summary.json') -Encoding utf8NoBOM
+    if (-not $compileContract.inspectable) {
+        Set-GateObservation compile-arguments-inspectable FAIL 'OPAQUE_OR_INVALID_COMPILE_ARGUMENTS'
+    } else {
+        Set-GateObservation compile-arguments-inspectable PASS 'all compile arguments are structurally inspectable'
+        if ($compileContract.passed) { Set-GateObservation crt PASS 'all compile entries prove Release /MD and exclude debug/static CRT' }
+        else { Set-GateObservation crt FAIL ($compileContract.errors -join '; ') }
+    }
+} catch { Set-GateObservation compile-arguments-inspectable FAIL $_.Exception.Message }
+
+$zipStem = if ($Backend -eq 'cpu') { "$Version-windows-x86_64-cpu" } else { "$Version-windows-x86_64-cuda-sm75-sm80-sm86-sm89" }
 $BundleRoot = Join-Path $PackageRoot $zipStem
-New-Item -ItemType Directory -Force -Path $BundleRoot | Out-Null
-Copy-Item -LiteralPath (Join-Path $InstallRoot 'bin') -Destination (Join-Path $BundleRoot 'bin') -Recurse
-if (Test-Path -LiteralPath (Join-Path $InstallRoot 'share')) {
-    Copy-Item -LiteralPath (Join-Path $InstallRoot 'share') -Destination (Join-Path $BundleRoot 'share') -Recurse
-}
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination (Join-Path $BundleRoot 'LICENSE')
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'NOTICE') -Destination (Join-Path $BundleRoot 'NOTICE')
-Copy-Item -LiteralPath $PatchPath -Destination (Join-Path $BundleRoot 'realtime-language-v1.patch')
+$bundleStaged = $false
+try {
+    New-Item -ItemType Directory -Force -Path $BundleRoot | Out-Null
+    Copy-Item -LiteralPath (Join-Path $InstallRoot 'bin') -Destination (Join-Path $BundleRoot 'bin') -Recurse
+    if (Test-Path -LiteralPath (Join-Path $InstallRoot 'share')) { Copy-Item -LiteralPath (Join-Path $InstallRoot 'share') -Destination (Join-Path $BundleRoot 'share') -Recurse }
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination (Join-Path $BundleRoot 'LICENSE')
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'NOTICE') -Destination (Join-Path $BundleRoot 'NOTICE')
+    Copy-Item -LiteralPath $PatchPath -Destination (Join-Path $BundleRoot 'realtime-language-v1.patch')
+    $bundleStaged = $true
+} catch { Set-GateObservation profile FAIL ('bundle staging: ' + $_.Exception.Message) }
 
-$compilerMatch = [regex]::Match($cache, '(?m)^CMAKE_CXX_COMPILER:[^=]+=(.+cl\.exe)$')
-if ($compilerMatch.Success) {
-    $clPath = $compilerMatch.Groups[1].Value.Trim().Replace('/', '\')
-} else {
-    $compilerMetadata = Get-ChildItem -LiteralPath (Join-Path $BuildRoot 'CMakeFiles') -Filter 'CMakeCXXCompiler.cmake' -File -Recurse | Select-Object -First 1
-    if (-not $compilerMetadata) { throw 'CMake compiler metadata is missing.' }
-    $compilerText = Get-Content -LiteralPath $compilerMetadata.FullName -Raw
-    $compilerFallback = [regex]::Match($compilerText, 'set\(CMAKE_CXX_COMPILER\s+"([^"]+cl\.exe)"\)')
-    if (-not $compilerFallback.Success) { throw 'Effective cl.exe could not be identified.' }
-    $clPath = $compilerFallback.Groups[1].Value.Replace('/', '\')
+$binNames = @()
+if ($bundleStaged) {
+    try {
+        $binNames = @(Get-ChildItem -LiteralPath (Join-Path $BundleRoot 'bin') -File | Select-Object -ExpandProperty Name)
+        $profileContract = Test-RuntimeBinaryProfile -Names $binNames -RequestedBackend $Backend
+        if (-not $profileContract.passed) { throw ($profileContract.errors -join '; ') }
+        Set-GateObservation profile PASS 'binary profile is exact and exhaustively classified'
+    } catch { Set-GateObservation profile FAIL $_.Exception.Message }
 }
-if (-not (Test-Path -LiteralPath $clPath)) { throw 'Effective cl.exe path is not materialized.' }
-$toolsetRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $clPath)))
-$toolsetVersion = Split-Path -Leaf $toolsetRoot
-$vsInstall = $clPath -replace '(?i)\\VC\\Tools\\MSVC\\.*$', ''
-$vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
-if (-not (Test-Path -LiteralPath $vcvars)) { throw 'vcvars64.bat for the effective toolchain is missing.' }
-$vcvarsOutput = (& cmd.exe /d /s /c "call `"$vcvars`" >nul 2>&1 && set VCToolsRedistDir && set VCToolsVersion" | Out-String)
-if ($LASTEXITCODE -ne 0) { throw 'Unable to query the effective MSVC Redist environment.' }
-$redistMatch = [regex]::Match($vcvarsOutput, '(?m)^VCToolsRedistDir=(.+)$')
-$vcVersionMatch = [regex]::Match($vcvarsOutput, '(?m)^VCToolsVersion=(.+)$')
-if (-not $redistMatch.Success -or -not $vcVersionMatch.Success) { throw 'MSVC Redist or toolset version was not reported.' }
-$reportedToolsetVersion = $vcVersionMatch.Groups[1].Value.Trim().TrimEnd('\')
-if ($reportedToolsetVersion -ne $toolsetVersion) { throw 'Compiler and Redist toolset versions do not match.' }
-$redistVersionRoot = $redistMatch.Groups[1].Value.Trim().TrimEnd('\')
-$redistVersion = Split-Path -Leaf $redistVersionRoot
-$redistRoot = Join-Path $redistVersionRoot 'x64\Microsoft.VC143.CRT'
-if (-not (Test-Path -LiteralPath $redistRoot)) { throw 'Release x64 MSVC Redist directory is missing.' }
-$dumpbinPath = Join-Path (Split-Path -Parent $clPath) 'dumpbin.exe'
-if (-not (Test-Path -LiteralPath $dumpbinPath)) { throw 'dumpbin.exe from the effective toolchain is missing.' }
 
-$msvcLicenseDir = Join-Path $BundleRoot 'share\licenses\microsoft-visual-cpp-runtime'
-New-Item -ItemType Directory -Force -Path $msvcLicenseDir | Out-Null
-$vsLicensePath = Join-Path $msvcLicenseDir 'Visual-Studio-2022-Community-License-EN.docx'
-$vsRedistListPath = Join-Path $msvcLicenseDir 'Visual-Studio-2022-Redistribution.html'
-Invoke-WebRequest -Uri $VsLicenseUrl -OutFile $vsLicensePath
-Invoke-WebRequest -Uri $VsRedistListUrl -OutFile $vsRedistListPath
-if ((Get-FileHash -LiteralPath $vsLicensePath -Algorithm SHA256).Hash -ne $VsLicenseSha256) {
-    throw 'Applicable Visual Studio license terms changed or failed their pin.'
-}
-if ((Get-FileHash -LiteralPath $vsRedistListPath -Algorithm SHA256).Hash -ne $VsRedistListSha256) {
-    throw 'Official Visual Studio REDIST list changed or failed its pin.'
-}
-$redistListText = Get-Content -LiteralPath $vsRedistListPath -Raw
-if ($redistListText -notmatch 'copy and distribute with your program any of the files within the following folder' -or
-    $redistListText -notmatch '(?i)VC\\Redist') {
-    throw 'Official Visual Studio REDIST grant/list evidence is incomplete.'
-}
-$installedRedistList = Get-ChildItem -LiteralPath (Join-Path $vsInstall 'Licenses') -Filter 'Redist.txt' -File -Recurse |
-    Sort-Object @{Expression={ if ($_.Directory.Name -eq '1033') { 0 } else { 1 } }}, FullName |
-    Select-Object -First 1
-if (-not $installedRedistList) { throw 'Installed Visual Studio Redist.txt pointer is missing.' }
-Copy-Item -LiteralPath $installedRedistList.FullName -Destination (Join-Path $msvcLicenseDir 'Redist.txt')
+$clPath = $null
+$vsInstall = $null
+$redistRoot = $null
+$redistVersion = $null
+$reportedToolsetVersion = $null
+$dumpbinPath = $null
+$installedRedistList = $null
+if ($bundleStaged -and (Test-GateObservationPassed cache)) {
+    try {
+        $clPath = $cacheContract.entries['CMAKE_CXX_COMPILER'].value.Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $clPath -PathType Leaf)) { throw 'Effective cl.exe is not materialized.' }
+        $toolsetRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $clPath)))
+        $toolsetVersion = Split-Path -Leaf $toolsetRoot
+        $vsInstall = $clPath -replace '(?i)\\VC\\Tools\\MSVC\\.*$', ''
+        $vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
+        if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) { throw 'vcvars64.bat is missing.' }
+        $vcvarsCommand = 'call "' + $vcvars + '" >nul 2>&1 && set VCToolsRedistDir && set VCToolsVersion'
+        $vcvarsOutput = (& cmd.exe /d /s /c $vcvarsCommand | Out-String)
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to query the effective MSVC Redist environment.' }
+        [IO.File]::WriteAllText((Join-Path $EvidenceRoot 'vcvars.sanitized.txt'), (ConvertTo-SanitizedEvidenceText -Content $vcvarsOutput), [Text.UTF8Encoding]::new($false))
+        $vcvarsContract = ConvertFrom-ExactKeyValueText -Text $vcvarsOutput
+        if ($vcvarsContract.errors.Count -ne 0 -or -not $vcvarsContract.entries.Contains('VCToolsRedistDir') -or
+            -not $vcvarsContract.entries.Contains('VCToolsVersion') -or $vcvarsContract.entries.Count -ne 2) { throw 'MSVC Redist/toolset output is malformed or ambiguous.' }
+        $reportedToolsetVersion = $vcvarsContract.entries['VCToolsVersion'].Trim().TrimEnd('\')
+        if ($reportedToolsetVersion -cne $toolsetVersion) { throw 'Compiler and Redist toolset versions differ.' }
+        $redistVersionRoot = $vcvarsContract.entries['VCToolsRedistDir'].Trim().TrimEnd('\')
+        $redistVersion = Split-Path -Leaf $redistVersionRoot
+        $redistRoot = Join-Path $redistVersionRoot 'x64\Microsoft.VC143.CRT'
+        if (-not (Test-Path -LiteralPath $redistRoot -PathType Container)) { throw 'Release x64 MSVC Redist directory is missing.' }
+        $dumpbinPath = Join-Path (Split-Path -Parent $clPath) 'dumpbin.exe'
+        if (-not (Test-Path -LiteralPath $dumpbinPath -PathType Leaf)) { throw 'dumpbin.exe is missing.' }
 
+        $msvcLicenseDir = Join-Path $BundleRoot 'share\licenses\microsoft-visual-cpp-runtime'
+        New-Item -ItemType Directory -Force -Path $msvcLicenseDir | Out-Null
+        $vsLicensePath = Join-Path $msvcLicenseDir 'Visual-Studio-2022-Community-License-EN.docx'
+        $vsRedistListPath = Join-Path $msvcLicenseDir 'Visual-Studio-2022-Redistribution.html'
+        Invoke-WebRequest -Uri $VsLicenseUrl -OutFile $vsLicensePath
+        Invoke-WebRequest -Uri $VsRedistListUrl -OutFile $vsRedistListPath
+        if ((Get-FileHash -LiteralPath $vsLicensePath -Algorithm SHA256).Hash -cne $VsLicenseSha256) { throw 'Visual Studio license pin mismatch.' }
+        if ((Get-FileHash -LiteralPath $vsRedistListPath -Algorithm SHA256).Hash -cne $VsRedistListSha256) { throw 'Visual Studio REDIST pin mismatch.' }
+        $installedRedistList = Get-ChildItem -LiteralPath (Join-Path $vsInstall 'Licenses') -Filter 'Redist.txt' -File -Recurse |
+            Sort-Object @{Expression={ if ($_.Directory.Name -eq '1033') { 0 } else { 1 } }}, FullName | Select-Object -First 1
+        if (-not $installedRedistList) { throw 'Installed Visual Studio Redist.txt is missing.' }
+        Copy-Item -LiteralPath $installedRedistList.FullName -Destination (Join-Path $msvcLicenseDir 'Redist.txt')
+
+        if ($Backend -eq 'cuda') {
+            $cudaEula = Join-Path $env:CUDA_PATH 'EULA.txt'
+            if (-not (Test-Path -LiteralPath $cudaEula -PathType Leaf)) { throw 'Pinned CUDA Toolkit EULA.txt is missing.' }
+            $cudaLicenseDir = Join-Path $BundleRoot 'share\licenses\nvidia-cuda-toolkit'
+            New-Item -ItemType Directory -Force -Path $cudaLicenseDir | Out-Null
+            Copy-Item -LiteralPath $cudaEula -Destination (Join-Path $cudaLicenseDir 'EULA.txt')
+        }
+        [ordered]@{
+            schema='diagnotes-legal-pins-v1'; visual_studio_license_sha256=$VsLicenseSha256; visual_studio_redist_list_sha256=$VsRedistListSha256
+            installed_redist_pointer_sha256=(Get-FileHash -LiteralPath $installedRedistList.FullName -Algorithm SHA256).Hash
+            cuda_eula_present=($Backend -ne 'cuda' -or (Test-Path -LiteralPath (Join-Path $BundleRoot 'share\licenses\nvidia-cuda-toolkit\EULA.txt')))
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'legal.json') -Encoding utf8NoBOM
+        Set-GateObservation legal PASS 'pinned legal bytes and in-package notices are present'
+    } catch { Set-GateObservation legal FAIL $_.Exception.Message }
+}
+
+$peClosure = $null
 $systemDlls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 @(
-    'ADVAPI32.dll','BCRYPT.dll','BCRYPTPRIMITIVES.dll','CABINET.dll','CFGMGR32.dll','COMCTL32.dll',
-    'COMDLG32.dll','CRYPT32.dll','DNSAPI.dll','GDI32.dll','IMM32.dll','IPHLPAPI.dll','KERNEL32.dll',
-    'MSWSOCK.dll','NETAPI32.dll','NORMALIZ.dll','NTDLL.dll','OLE32.dll','OLEAUT32.dll','POWRPROF.dll',
-    'PSAPI.dll','RPCRT4.dll','SECUR32.dll','SETUPAPI.dll','SHELL32.dll','SHLWAPI.dll','USER32.dll',
-    'USERENV.dll','UCRTBASE.dll','VERSION.dll','WINHTTP.dll','WINMM.dll','WS2_32.dll','WTSAPI32.dll'
+    'ADVAPI32.dll','BCRYPT.dll','BCRYPTPRIMITIVES.dll','CABINET.dll','CFGMGR32.dll','COMCTL32.dll','COMDLG32.dll',
+    'CRYPT32.dll','DNSAPI.dll','GDI32.dll','IMM32.dll','IPHLPAPI.dll','KERNEL32.dll','MSWSOCK.dll','NETAPI32.dll',
+    'NORMALIZ.dll','NTDLL.dll','OLE32.dll','OLEAUT32.dll','POWRPROF.dll','PSAPI.dll','RPCRT4.dll','SECUR32.dll',
+    'SETUPAPI.dll','SHELL32.dll','SHLWAPI.dll','USER32.dll','USERENV.dll','UCRTBASE.dll','VERSION.dll','WINHTTP.dll',
+    'WINMM.dll','WS2_32.dll','WTSAPI32.dll'
 ) | ForEach-Object { [void]$systemDlls.Add($_) }
 $msvcPattern = '^(?i:(?:msvcp|vcruntime|concrt|vccorlib)140(?:_[0-9A-Za-z]+)?\.dll)$'
 
@@ -598,15 +1114,13 @@ function Get-PeDependencies {
     param([Parameter(Mandatory)][string]$Path)
     $output = (& $dumpbinPath /DEPENDENTS $Path 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) { throw 'dumpbin dependency inspection failed.' }
-    return @([regex]::Matches($output, '(?im)^\s+([A-Za-z0-9_.-]+\.dll)\s*$') |
-        ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    $parsed = ConvertFrom-DumpbinDependentsText -Text $output
+    if (-not $parsed.passed) { throw "dumpbin dependency output failed structural parsing: $($parsed.reason)" }
+    return @($parsed.dependencies)
 }
 
 function Resolve-PeClosure {
-    param(
-        [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][bool]$AllowMsvcCopy
-    )
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][bool]$AllowMsvcCopy)
     $binRoot = Join-Path $Root 'bin'
     $files = @{}
     Get-ChildItem -LiteralPath $binRoot -File -Recurse | Where-Object { $_.Extension -in '.exe','.dll' } | ForEach-Object {
@@ -630,223 +1144,211 @@ function Resolve-PeClosure {
             if ($dependency -match $msvcPattern) {
                 if ($dependency -match '(?i)d\.dll$') { throw 'Debug MSVC runtime import is not redistributable.' }
                 $source = Join-Path $redistRoot $dependency
-                if (-not (Test-Path -LiteralPath $source)) { throw 'Required MSVC DLL is absent from the effective Redist.' }
-                if ($files.ContainsKey($key)) {
-                    $resolved = $files[$key]
-                } else {
-                    if (-not $AllowMsvcCopy) { throw 'Clean ZIP extraction is missing an app-local MSVC dependency.' }
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'Required MSVC DLL is absent from Redist.' }
+                if ($files.ContainsKey($key)) { $resolved = $files[$key] }
+                else {
+                    if (-not $AllowMsvcCopy) { throw 'Clean ZIP extraction lacks an app-local MSVC dependency.' }
                     $resolved = Join-Path $binRoot $dependency
                     Copy-Item -LiteralPath $source -Destination $resolved
                     $files[$key] = $resolved
                 }
-                if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne
-                    (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash) {
-                    throw 'App-local MSVC DLL differs from the effective Redist bytes.'
+                if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash) {
+                    throw 'App-local MSVC DLL differs from Redist bytes.'
                 }
                 $signature = Get-AuthenticodeSignature -LiteralPath $resolved
-                if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
-                    throw 'App-local MSVC DLL lacks a valid Microsoft signature.'
+                if ($null -eq $signature.SignerCertificate -or -not (Test-MicrosoftSignerIdentity -Status ([string]$signature.Status) -Subject $signature.SignerCertificate.Subject)) {
+                    throw 'App-local MSVC DLL signer identity is invalid.'
                 }
                 if ($recordedMsvc.Add($dependency)) {
                     $copied += [ordered]@{
-                        name=$dependency
-                        size=(Get-Item -LiteralPath $resolved).Length
-                        sha256=(Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash
-                        file_version=(Get-Item -LiteralPath $resolved).VersionInfo.FileVersion
-                        product_version=(Get-Item -LiteralPath $resolved).VersionInfo.ProductVersion
-                        architecture='x64'
-                        origin="VC/Redist/MSVC/$redistVersion/x64/Microsoft.VC143.CRT/$dependency"
-                        license='LicenseRef-Microsoft-Visual-Cpp-Runtime'
-                        signer=$signature.SignerCertificate.Subject
+                        name=$dependency; size=(Get-Item -LiteralPath $resolved).Length; sha256=(Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash
+                        file_version=(Get-Item -LiteralPath $resolved).VersionInfo.FileVersion; product_version=(Get-Item -LiteralPath $resolved).VersionInfo.ProductVersion
+                        architecture='x64'; origin="VC/Redist/MSVC/$redistVersion/x64/Microsoft.VC143.CRT/$dependency"
+                        license='LicenseRef-Microsoft-Visual-Cpp-Runtime'; signer=$signature.SignerCertificate.Subject
                     }
                 }
                 $classification = 'msvc-redist-app-local'
-            } elseif ($files.ContainsKey($key)) {
-                $classification = 'app-local'
-                $resolved = $files[$key]
-            } elseif ($dependency -match '^(?i:api-ms-win-|ext-ms-win-)') {
-                $classification = 'windows-api-set'
-            } elseif ($systemDlls.Contains($dependency)) {
-                $classification = 'windows-system'
-            } elseif ($Backend -eq 'cuda' -and $dependency -ieq 'nvcuda.dll') {
-                $classification = 'nvidia-host-driver-prerequisite'
-            } else {
-                throw "Unresolved non-system PE dependency: $dependency"
-            }
-            $edges += [ordered]@{
-                importer=[IO.Path]::GetFileName($importer)
-                dependency=$dependency
-                classification=$classification
-            }
+            } elseif ($files.ContainsKey($key)) { $classification = 'app-local'; $resolved = $files[$key] }
+            elseif ($dependency -match '^(?i:api-ms-win-|ext-ms-win-)') { $classification = 'windows-api-set' }
+            elseif ($systemDlls.Contains($dependency)) { $classification = 'windows-system' }
+            elseif ($Backend -eq 'cuda' -and $dependency -ieq 'nvcuda.dll') { $classification = 'nvidia-host-driver-prerequisite' }
+            else { throw "Unresolved non-system PE dependency: $dependency" }
+            $edges += [ordered]@{ importer=[IO.Path]::GetFileName($importer); dependency=$dependency; classification=$classification }
             if ($resolved) { $queue.Enqueue($resolved) }
         }
     }
     return [ordered]@{ edges=$edges; copied_msvc=$copied; pe_count=$seen.Count }
 }
 
-$peClosure = Resolve-PeClosure -Root $BundleRoot -AllowMsvcCopy $true
-$msvcEvidence = [ordered]@{
-    schema='diagnotes-msvc-redist-v1'
-    toolset_version=$reportedToolsetVersion
-    redist_version=$redistVersion
-    redist_directory="VC/Redist/MSVC/$redistVersion/x64/Microsoft.VC143.CRT"
-    visual_studio_license_sha256=$VsLicenseSha256
-    visual_studio_redist_list_sha256=$VsRedistListSha256
-    installed_redist_pointer_sha256=(Get-FileHash -LiteralPath $installedRedistList.FullName -Algorithm SHA256).Hash
-    dlls=$peClosure.copied_msvc
+if ($bundleStaged -and (Test-GateObservationPassed cache) -and (Test-GateObservationPassed legal)) {
+    try {
+        $peClosure = Resolve-PeClosure -Root $BundleRoot -AllowMsvcCopy $true
+        [ordered]@{
+            schema='diagnotes-msvc-redist-v1'; toolset_version=$reportedToolsetVersion; redist_version=$redistVersion
+            redist_directory="VC/Redist/MSVC/$redistVersion/x64/Microsoft.VC143.CRT"; visual_studio_license_sha256=$VsLicenseSha256
+            visual_studio_redist_list_sha256=$VsRedistListSha256; installed_redist_pointer_sha256=(Get-FileHash -LiteralPath $installedRedistList.FullName -Algorithm SHA256).Hash
+            dlls=$peClosure.copied_msvc
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $BundleRoot 'msvc-redist-inventory.json') -Encoding utf8NoBOM
+        [ordered]@{ schema='diagnotes-pe-closure-v1'; imports=$peClosure.edges } | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath (Join-Path $BundleRoot 'pe-imports.json') -Encoding utf8NoBOM
+        [ordered]@{ schema='diagnotes-pe-closure-evidence-v1'; pe_count=$peClosure.pe_count; import_count=$peClosure.edges.Count; signer_policy='Status Valid and O=Microsoft Corporation' } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'pe-closure.json') -Encoding utf8NoBOM
+        Set-GateObservation pe-closure PASS 'strict dumpbin parser, PE closure and structured signer identity passed'
+    } catch { Set-GateObservation pe-closure FAIL $_.Exception.Message }
 }
-$msvcEvidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $BundleRoot 'msvc-redist-inventory.json') -Encoding utf8NoBOM
-[ordered]@{ schema='diagnotes-pe-closure-v1'; imports=$peClosure.edges } | ConvertTo-Json -Depth 8 |
-    Set-Content -LiteralPath (Join-Path $BundleRoot 'pe-imports.json') -Encoding utf8NoBOM
-
-if ($Backend -eq 'cuda') {
-    $cudaEula = Join-Path $env:CUDA_PATH 'EULA.txt'
-    if (-not (Test-Path -LiteralPath $cudaEula)) { throw 'Pinned CUDA Toolkit EULA.txt is missing.' }
-    $cudaLicenseDir = Join-Path $BundleRoot 'share\licenses\nvidia-cuda-toolkit'
-    New-Item -ItemType Directory -Force -Path $cudaLicenseDir | Out-Null
-    Copy-Item -LiteralPath $cudaEula -Destination (Join-Path $cudaLicenseDir 'EULA.txt')
-}
-
-$binNames = @(Get-ChildItem -LiteralPath (Join-Path $BundleRoot 'bin') -File | Select-Object -ExpandProperty Name)
-$forbidden = @($binNames | Where-Object { $_ -match '(?i)diar|tts|nmt|translate|synth|mic|miniaudio' })
-if ($forbidden.Count -gt 0) { throw "Forbidden profile output: $($forbidden -join ', ')" }
-if ($binNames -notcontains 'nemo-speech.exe') { throw 'nemo-speech.exe missing from package.' }
-if ($Backend -eq 'cuda' -and -not ($binNames -contains 'ggml-cuda.dll')) { throw 'ggml-cuda.dll missing from CUDA package.' }
-if ($Backend -eq 'cpu' -and ($binNames -contains 'ggml-cuda.dll')) { throw 'CPU package contains ggml-cuda.dll.' }
-if ($binNames -contains 'nvcuda.dll') { throw 'NVIDIA driver must not be redistributed.' }
-
-$toolchain = [ordered]@{
-    identity = $Version; backend = $Backend; source_commit = $SourceCommit
-    patch_sha256 = $PatchSha256; patch_bytes = $PatchBytes
-    cuda_architectures = if ($Backend -eq 'cuda') { @('75','80','86','89') } else { @() }
-    runtime_capabilities = @('realtime-language-v1')
-    github_image_os = $env:ImageOS; github_image_version = $env:ImageVersion
-    cmake = (& cmake --version | Select-Object -First 1)
-    ninja = (& ninja --version | Select-Object -First 1)
-    msvc = (& $clPath 2>&1 | Select-Object -First 1)
-    windows_sdk = $env:WindowsSDKVersion
-    vcpkg_commit = $ExpectedVcpkgCommit
-    vcpkg_triplet = $VcpkgTriplet
-    msvc_toolset_version = $reportedToolsetVersion
-    msvc_crt = 'dynamic-app-local'
-    cuda = if ($Backend -eq 'cuda') { (& "$env:CUDA_PATH\bin\nvcc.exe" --version | Select-Object -Last 1) } else { $null }
-    cuda_installer = if ($Backend -eq 'cuda') { [ordered]@{ url=$CudaInstallerUrl; sha256=$CudaInstallerSha256; md5=$CudaInstallerMd5; components=@('nvcc_12.8','cudart_12.8','cublas_12.8','cublas_dev_12.8','thrust_12.8'); driver=$false } } else { $null }
-    cmake_profile = [ordered]@{ asr=$true; http=$true; cli=$true; diar=$false; tts=$false; nmt=$false; mic_capture=$false }
-    authenticode = 'absent-by-contract'
-}
-$toolchain | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $BundleRoot 'runtime-build.json') -Encoding utf8NoBOM
-$sanitizedCache = ConvertTo-SanitizedEvidenceText -Content $cache
-[IO.File]::WriteAllText((Join-Path $EvidenceRoot 'CMakeCache.sanitized.txt'), $sanitizedCache, [Text.UTF8Encoding]::new($false))
-(git -C $SourceRoot diff --binary) | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'functional.diff') -Encoding utf8NoBOM
-$toolchain | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'toolchain.json') -Encoding utf8NoBOM
 
 $inventory = @()
-Get-ChildItem -LiteralPath $BundleRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
-    $relative = [IO.Path]::GetRelativePath($BundleRoot, $_.FullName).Replace('\','/')
-    $license = if ($relative -match '^bin/(?i:(?:msvcp|vcruntime|concrt|vccorlib)140(?:_[0-9A-Za-z]+)?\.dll)$') { 'LicenseRef-Microsoft-Visual-Cpp-Runtime' }
-        elseif ($relative -match '^bin/ggml') { 'MIT' }
-        elseif ($relative -match '^bin/cublas64_') { 'Apache-2.0 AND LicenseRef-NVIDIA-CUDA-Toolkit' }
-        elseif ($relative -match '^bin/') { 'Apache-2.0' }
-        elseif ($relative -match 'cpp-httplib') { 'MIT' }
-        elseif ($relative -match 'sentencepiece') { 'Apache-2.0' }
-        elseif ($relative -match 'nvidia-cuda-toolkit') { 'LicenseRef-NVIDIA-CUDA-Toolkit' }
-        elseif ($relative -match 'microsoft-visual-cpp-runtime') { 'LicenseRef-Microsoft-Visual-Studio-2022' }
-        else { 'Apache-2.0' }
-    $origin = if ($relative -match '^bin/(?i:(?:msvcp|vcruntime|concrt|vccorlib)140(?:_[0-9A-Za-z]+)?\.dll)$') { 'Microsoft Visual C++ Redist from effective MSVC toolchain' }
-        elseif ($relative -match '^bin/ggml') { 'ggml' }
-        elseif ($relative -match '^bin/cublas64_') { 'NeMo-Speech.cpp CUDA shim + CUDA static runtime' }
-        elseif ($relative -match 'microsoft-visual-cpp-runtime') { 'Microsoft official license/REDIST evidence' }
-        else { 'NeMo-Speech.cpp distribution' }
-    $inventory += [ordered]@{
-        path=$relative; size=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
-        kind=if ($_.Extension -in '.exe','.dll') { 'PE' } else { 'data' }
-        origin=$origin
-        license=$license
-    }
+$toolchain = $null
+if ((Test-GateObservationPassed profile) -and (Test-GateObservationPassed legal) -and (Test-GateObservationPassed pe-closure)) {
+    try {
+        $toolchain = [ordered]@{
+            identity=$Version; backend=$Backend; source_commit=$SourceCommit; patch_sha256=$PatchSha256; patch_bytes=$PatchBytes
+            cuda_architectures=if ($Backend -eq 'cuda') { @('75','80','86','89') } else { @() }
+            runtime_capabilities=@('realtime-language-v1'); github_image_os=$env:ImageOS; github_image_version=$env:ImageVersion
+            cmake=(& cmake --version | Select-Object -First 1); ninja=(& ninja --version | Select-Object -First 1)
+            msvc=(& $clPath 2>&1 | Select-Object -First 1); windows_sdk=$env:WindowsSDKVersion; vcpkg_commit=$ExpectedVcpkgCommit
+            vcpkg_triplet=$VcpkgTriplet; msvc_toolset_version=$reportedToolsetVersion; msvc_crt='dynamic-app-local'
+            cuda=if ($Backend -eq 'cuda') { (& "$env:CUDA_PATH\bin\nvcc.exe" --version | Select-Object -Last 1) } else { $null }
+            cuda_installer=if ($Backend -eq 'cuda') { [ordered]@{ url=$CudaInstallerUrl; sha256=$CudaInstallerSha256; md5=$CudaInstallerMd5; components=@('nvcc_12.8','cudart_12.8','cublas_12.8','cublas_dev_12.8','thrust_12.8'); driver=$false } } else { $null }
+            cmake_profile=[ordered]@{ asr=$true; http=$true; cli=$true; diar=$false; tts=$false; nmt=$false; mic_capture=$false }
+            authenticode='absent-by-contract'
+        }
+        $toolchain | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $BundleRoot 'runtime-build.json') -Encoding utf8NoBOM
+        $toolchain | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'toolchain.json') -Encoding utf8NoBOM
+        Get-ChildItem -LiteralPath $BundleRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($BundleRoot, $_.FullName).Replace('\','/')
+            $classification = Get-RuntimeFileClassification -RelativePath $relative
+            if (-not $classification.passed) { throw "Inventory path is unclassified: $relative" }
+            $inventory += [ordered]@{
+                path=$relative; size=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+                kind=if ($_.Extension -in '.exe','.dll') { 'PE' } else { 'data' }; origin=$classification.origin; license=$classification.license
+            }
+        }
+        [ordered]@{ schema='diagnotes-runtime-inventory-v1'; files=$inventory } | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath (Join-Path $BundleRoot 'inventory.json') -Encoding utf8NoBOM
+        [ordered]@{ schema='diagnotes-inventory-evidence-v1'; file_count=$inventory.Count; unknown_count=0 } | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath (Join-Path $EvidenceRoot 'inventory.json') -Encoding utf8NoBOM
+        Set-GateObservation inventory PASS 'every payload file has exactly one explicit origin/license rule'
+    } catch { Set-GateObservation inventory FAIL $_.Exception.Message }
 }
-[ordered]@{ schema='diagnotes-runtime-inventory-v1'; files=$inventory } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $BundleRoot 'inventory.json') -Encoding utf8NoBOM
 
-$spdxFiles = @($inventory | ForEach-Object {
-    [ordered]@{ fileName=$_.path; checksums=@([ordered]@{algorithm='SHA256';checksumValue=$_.sha256}); licenseConcluded=$_.license; licenseInfoInFiles=@($_.license) }
-})
-[ordered]@{
-    spdxVersion='SPDX-2.3'; dataLicense='CC0-1.0'; SPDXID='SPDXRef-DOCUMENT'
-    name="$zipStem-sbom"; documentNamespace="https://github.com/dnl0037/diagnotes-nemotron-runtime/sbom/$zipStem/$env:GITHUB_RUN_ID"
-    creationInfo=[ordered]@{ created=(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); creators=@('Tool: Build-Runtime.ps1') }
-    files=$spdxFiles
-} | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $BundleRoot 'sbom.spdx.json') -Encoding utf8NoBOM
+if (Test-GateObservationPassed inventory) {
+    try {
+        $spdxFiles = @($inventory | ForEach-Object {
+            [ordered]@{ fileName=$_.path; checksums=@([ordered]@{algorithm='SHA256';checksumValue=$_.sha256}); licenseConcluded=$_.license; licenseInfoInFiles=@($_.license) }
+        })
+        [ordered]@{
+            spdxVersion='SPDX-2.3'; dataLicense='CC0-1.0'; SPDXID='SPDXRef-DOCUMENT'; name="$zipStem-sbom"
+            documentNamespace="https://github.com/dnl0037/diagnotes-nemotron-runtime/sbom/$zipStem/$env:GITHUB_RUN_ID"
+            creationInfo=[ordered]@{ created=(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); creators=@('Tool: Build-Runtime.ps1') }
+            files=$spdxFiles
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $BundleRoot 'sbom.spdx.json') -Encoding utf8NoBOM
+        [ordered]@{ schema='diagnotes-sbom-evidence-v1'; files=$spdxFiles.Count; inventory_files=$inventory.Count } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'sbom.json') -Encoding utf8NoBOM
+        if ($spdxFiles.Count -ne $inventory.Count) { throw 'SBOM/inventory cardinality mismatch.' }
+        Set-GateObservation sbom PASS 'SPDX cardinality and SHA-256 values derive from exact inventory'
+    } catch { Set-GateObservation sbom FAIL $_.Exception.Message }
+}
 
 $zipPath = Join-Path $ArtifactsRoot "$zipStem.zip"
-Compress-Archive -LiteralPath $BundleRoot -DestinationPath $zipPath -CompressionLevel Optimal
-$extracted = Join-Path $WorkRoot 'zip-recheck'
-Expand-Archive -LiteralPath $zipPath -DestinationPath $extracted
-$recheckRoot = Join-Path $extracted $zipStem
-if (-not (Test-Path -LiteralPath (Join-Path $recheckRoot 'bin\nemo-speech.exe'))) { throw 'Clean ZIP extraction lacks nemo-speech.exe.' }
-$extractedClosure = Resolve-PeClosure -Root $recheckRoot -AllowMsvcCopy $false
-foreach ($entry in $inventory) {
-    $extractedPath = Join-Path $recheckRoot $entry.path.Replace('/', '\')
-    if (-not (Test-Path -LiteralPath $extractedPath -PathType Leaf)) { throw 'Clean ZIP extraction is missing an inventoried file.' }
-    if ((Get-Item -LiteralPath $extractedPath).Length -ne $entry.size -or
-        (Get-FileHash -LiteralPath $extractedPath -Algorithm SHA256).Hash -ne $entry.sha256) {
-        throw 'Clean ZIP extraction differs from the inventoried bytes.'
+$recheckRoot = $null
+$extractedClosure = $null
+if ((Test-GateObservationPassed inventory) -and (Test-GateObservationPassed sbom)) {
+    try {
+        Compress-Archive -LiteralPath $BundleRoot -DestinationPath $zipPath -CompressionLevel Optimal
+        $extracted = Join-Path $WorkRoot 'zip-recheck'
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extracted
+        $recheckRoot = Join-Path $extracted $zipStem
+        if (-not (Test-Path -LiteralPath (Join-Path $recheckRoot 'bin\nemo-speech.exe') -PathType Leaf)) { throw 'Clean ZIP extraction lacks nemo-speech.exe.' }
+        $extractedClosure = Resolve-PeClosure -Root $recheckRoot -AllowMsvcCopy $false
+        foreach ($entry in $inventory) {
+            $extractedPath = Join-Path $recheckRoot $entry.path.Replace('/', '\')
+            if (-not (Test-Path -LiteralPath $extractedPath -PathType Leaf)) { throw "Clean ZIP extraction is missing $($entry.path)." }
+            if ((Get-Item -LiteralPath $extractedPath).Length -ne $entry.size -or (Get-FileHash -LiteralPath $extractedPath -Algorithm SHA256).Hash -cne $entry.sha256) {
+                throw "Clean ZIP extraction differs at $($entry.path)."
+            }
+        }
+        [ordered]@{
+            schema='diagnotes-zip-recheck-v1'; name=(Split-Path -Leaf $zipPath); size=(Get-Item -LiteralPath $zipPath).Length
+            sha256=(Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; inventoried_files=$inventory.Count; pe_import_edges=$extractedClosure.edges.Count
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'zip-recheck.json') -Encoding utf8NoBOM
+        Set-GateObservation zip-extraction PASS 'final ZIP name/hash and clean extraction match inventory'
+    } catch { Set-GateObservation zip-extraction FAIL $_.Exception.Message }
+}
+
+$defenderScans = @()
+$defenderInfrastructure = $null
+if (Test-GateObservationPassed zip-extraction) {
+    try {
+        $mpStatus = Get-MpComputerStatus -ErrorAction Stop
+        if (-not $mpStatus.AntivirusEnabled -or -not $mpStatus.RealTimeProtectionEnabled) { throw 'Microsoft Defender is not enabled.' }
+        $mpCandidates = @((Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'))
+        $platformRoot = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform'
+        if (Test-Path -LiteralPath $platformRoot) {
+            $mpCandidates += @(Get-ChildItem -LiteralPath $platformRoot -Filter 'MpCmdRun.exe' -File -Recurse | Sort-Object FullName -Descending | Select-Object -ExpandProperty FullName)
+        }
+        $mpCmd = @($mpCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1)
+        if ($mpCmd.Count -ne 1) { throw 'Microsoft Defender CLI is missing.' }
+        foreach ($scanTarget in @(
+            [pscustomobject]@{ id='defender-tree'; name='clean-extracted-tree'; path=$recheckRoot },
+            [pscustomobject]@{ id='defender-zip'; name='final-zip'; path=$zipPath }
+        )) {
+            $scanStarted = [DateTimeOffset]::UtcNow
+            $scanOutput = (& $mpCmd[0] -Scan -ScanType 3 -File $scanTarget.path 2>&1 | Out-String)
+            $scanExit = $LASTEXITCODE
+            $scanEnded = [DateTimeOffset]::UtcNow
+            [IO.File]::WriteAllText((Join-Path $EvidenceRoot "$($scanTarget.id).sanitized.log"), (ConvertTo-SanitizedEvidenceText -Content $scanOutput), [Text.UTF8Encoding]::new($false))
+            $defenderScans += [ordered]@{ target=$scanTarget.name; started_utc=$scanStarted.ToString('o'); ended_utc=$scanEnded.ToString('o'); exit_code=$scanExit }
+            if ($scanExit -eq 0) { Set-GateObservation $scanTarget.id PASS "$($scanTarget.name) Defender scan clean" }
+            else { Set-GateObservation $scanTarget.id FAIL "$($scanTarget.name) Defender exit $scanExit" }
+        }
+    } catch {
+        $defenderInfrastructure = $_.Exception.Message
+        if (-not $gateObservations.Contains('defender-tree')) { Set-GateObservation defender-tree FAIL $defenderInfrastructure }
+        if (-not $gateObservations.Contains('defender-zip')) { Set-GateObservation defender-zip FAIL $defenderInfrastructure }
+    } finally {
+        [ordered]@{
+            schema='diagnotes-defender-v2'; infrastructure_error=if ($defenderInfrastructure) { ConvertTo-SanitizedEvidenceText -Content $defenderInfrastructure } else { $null }
+            scans=$defenderScans
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'defender.json') -Encoding utf8NoBOM
     }
 }
 
-$mpStatus = Get-MpComputerStatus -ErrorAction Stop
-if (-not $mpStatus.AntivirusEnabled -or -not $mpStatus.RealTimeProtectionEnabled) {
-    throw 'Microsoft Defender is not enabled on the build runner.'
-}
-$mpCandidates = @(
-    (Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe')
-)
-$platformRoot = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform'
-if (Test-Path -LiteralPath $platformRoot) {
-    $mpCandidates += @(Get-ChildItem -LiteralPath $platformRoot -Filter 'MpCmdRun.exe' -File -Recurse |
-        Sort-Object FullName -Descending | Select-Object -ExpandProperty FullName)
-}
-$mpCmd = @($mpCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
-if ($mpCmd.Count -ne 1) { throw 'Microsoft Defender command-line scanner is missing.' }
-$defenderScans = @()
-$scanIndex = 0
-foreach ($scanTarget in @($recheckRoot, $zipPath)) {
-    $scanIndex++
-    $scanStarted = [DateTimeOffset]::UtcNow
-    $scanOutput = (& $mpCmd[0] -Scan -ScanType 3 -File $scanTarget 2>&1 | Out-String)
-    $scanExit = $LASTEXITCODE
-    $scanEnded = [DateTimeOffset]::UtcNow
-    $sanitizedScanOutput = ConvertTo-SanitizedEvidenceText -Content $scanOutput
-    [IO.File]::WriteAllText(
-        (Join-Path $EvidenceRoot "defender-scan-$scanIndex.sanitized.log"),
-        $sanitizedScanOutput,
-        [Text.UTF8Encoding]::new($false)
-    )
-    $defenderScans += [ordered]@{
-        target=if ($scanIndex -eq 1) { 'clean-extracted-tree' } else { 'final-zip' }
-        started_utc=$scanStarted.ToString('o')
-        ended_utc=$scanEnded.ToString('o')
-        exit_code=$scanExit
+try {
+    $privacyViolations = @()
+    Get-ChildItem -LiteralPath $EvidenceRoot -File -Recurse | ForEach-Object {
+        if ($_.Extension -notin @('.json','.txt','.log','.diff')) { return }
+        $evidenceText = [IO.File]::ReadAllText($_.FullName)
+        if ($evidenceText -match '(?i)(?:[A-Z]:\\Users\\|D:\\a\\|Authorization\s*[:=]\s*(?!<redacted>)|Bearer\s+(?!<redacted>)|["'']?(?:token|secret|password)["'']?\s*[:=]\s*(?!<redacted>))') {
+            $privacyViolations += $_.Name
+        }
     }
-    if ($scanExit -ne 0) { throw 'Microsoft Defender scan failed or detected a threat.' }
+    if ($privacyViolations.Count -ne 0) { throw ('unsanitized evidence: ' + ($privacyViolations -join ',')) }
+    Set-GateObservation privacy PASS 'sanitized evidence contains no private-root or credential markers'
+} catch { Set-GateObservation privacy FAIL $_.Exception.Message }
+
+$internalPrerequisites = @(
+    'source-patch','cache','vcpkg','compile-arguments-inspectable','crt','profile','legal','pe-closure',
+    'inventory','sbom','zip-extraction','defender-tree','defender-zip','privacy'
+)
+if (@($internalPrerequisites | Where-Object { -not (Test-GateObservationPassed $_) }).Count -eq 0) {
+    Set-GateObservation candidate-bytes-ready PASS 'all internal candidate byte prerequisites passed'
 }
-$defenderEvidence = [ordered]@{
-    schema='diagnotes-defender-v1'
-    antivirus_enabled=$mpStatus.AntivirusEnabled
-    realtime_enabled=$mpStatus.RealTimeProtectionEnabled
-    engine_version=$mpStatus.AMEngineVersion
-    antivirus_signature_version=$mpStatus.AntivirusSignatureVersion
-    antivirus_signature_updated=$mpStatus.AntivirusSignatureLastUpdated.ToString('o')
-    scans=$defenderScans
+
+$gatePayload = $null
+$gateWriteFailure = $null
+try { $gatePayload = Write-GateResults } catch { $gateWriteFailure = $_.Exception.GetType().FullName }
+if ($gateWriteFailure) { throw "Unable to materialize gate-results.json: $gateWriteFailure" }
+$candidateGate = @($gatePayload.gates | Where-Object id -eq 'candidate-bytes-ready')
+if ($candidateGate.Count -ne 1 -or $candidateGate[0].status -ne 'PASS') {
+    $failed = @($gatePayload.gates | Where-Object { $_.status -ne 'PASS' -and $_.id -notin @('attestation-created','attestation-digest-verified','candidate-upload-eligible') } | ForEach-Object { "$($_.id)=$($_.status)" })
+    throw "Runtime candidate gates failed: $($failed -join ', ')"
 }
-$defenderEvidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'defender.json') -Encoding utf8NoBOM
 
 $result = [ordered]@{
-    backend=$Backend
-    zip=(Split-Path -Leaf $zipPath)
-    size=(Get-Item $zipPath).Length
-    sha256=(Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
-    files=$binNames
-    pe_import_edges=$extractedClosure.edges.Count
-    defender='clean'
+    backend=$Backend; zip=(Split-Path -Leaf $zipPath); size=(Get-Item $zipPath).Length
+    sha256=(Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; files=$binNames
+    pe_import_edges=$extractedClosure.edges.Count; defender='clean'; gate_results=$gateResultsPath
 }
 $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'build-result.json') -Encoding utf8NoBOM
 $result | ConvertTo-Json -Depth 6

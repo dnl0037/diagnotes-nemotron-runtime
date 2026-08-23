@@ -1,4 +1,4 @@
-name: Build final Windows runtime ZIPs
+name: Build private runtime candidates
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ permissions:
 
 jobs:
   build:
-    name: build-${{ matrix.backend }}
+    name: candidate-${{ matrix.backend }}
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -19,6 +19,8 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout recipe
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -30,9 +32,10 @@ jobs:
           "ImageOS=$env:ImageOS"
           "ImageVersion=$env:ImageVersion"
 
-      - name: Prove lid.3 recipe before network
+      - name: Prove structured gates before build network
         shell: pwsh
         run: |
+          .\scripts\Test-RuntimeGates.ps1 -EvidencePath ".\artifacts\evidence-${{ matrix.backend }}\gates-preflight.json"
           .\scripts\Test-RuntimeRecipe.ps1 -EvidencePath ".\artifacts\evidence-${{ matrix.backend }}\recipe-preflight.json"
 
       - name: Prove sanitizer before CUDA
@@ -41,7 +44,7 @@ jobs:
         run: |
           .\scripts\Test-BuildRuntimeHelpers.ps1 -BuildScriptPath .\scripts\Build-Runtime.ps1 -EvidencePath .\artifacts\sanitizer-preflight\sanitizer-preflight.json
 
-      - name: Build final ZIP
+      - name: Build candidate bytes once
         id: build
         shell: pwsh
         run: |
@@ -55,15 +58,34 @@ jobs:
             'nemo-speech-v0.1.0-diagnotes-lid.3-windows-x86_64-cuda-sm75-sm80-sm86-sm89.zip'
           }
           if ($zip.Name -ne $expected) { throw "Unexpected ZIP name: $($zip.Name)" }
+          $gateResults = Resolve-Path -LiteralPath ".\artifacts\evidence-${{ matrix.backend }}\gate-results.json"
           "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
           "zip_name=$($zip.Name)" >> $env:GITHUB_OUTPUT
+          "gate_results=$($gateResults.Path)" >> $env:GITHUB_OUTPUT
           Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256
 
-      - name: Attest final ZIP bytes
+      - name: Attest exact candidate bytes
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
         with:
           subject-path: ${{ steps.build.outputs.zip_path }}
           show-summary: false
+
+      - name: Verify attestation subject and finalize gates
+        id: verify
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $verificationPath = ".\artifacts\evidence-${{ matrix.backend }}\attestation-verification.json"
+          $verifyArgs = @('attestation','verify','${{ steps.build.outputs.zip_path }}','--repo',$env:GITHUB_REPOSITORY,'--signer-workflow',"github.com/$env:GITHUB_REPOSITORY/.github/workflows/build-release.yml",'--source-digest',$env:GITHUB_SHA,'--format','json')
+          $verifyOutput = (& gh @verifyArgs 2>&1 | Out-String)
+          $verifyExit = $LASTEXITCODE
+          if ($verifyExit -eq 0) { [IO.File]::WriteAllText($verificationPath, $verifyOutput, [Text.UTF8Encoding]::new($false)) }
+          else { [IO.File]::WriteAllText($verificationPath, '[]', [Text.UTF8Encoding]::new($false)) }
+          [ordered]@{ schema='diagnotes-attestation-command-v1'; exit_code=$verifyExit } | ConvertTo-Json | Set-Content -LiteralPath ".\artifacts\evidence-${{ matrix.backend }}\attestation-command.json" -Encoding utf8NoBOM
+          .\scripts\Test-RuntimeGates.ps1 -Mode FinalizeAttestation -GateResultsPath '${{ steps.build.outputs.gate_results }}' -ZipPath '${{ steps.build.outputs.zip_path }}' -VerificationPath $verificationPath
+          $final = Get-Content -LiteralPath '${{ steps.build.outputs.gate_results }}' -Raw | ConvertFrom-Json -Depth 30
+          $notGreen = @($final.gates | Where-Object status -ne 'PASS')
+          if ($notGreen.Count -ne 0) { throw "Final candidate gate record is not fully green: $($notGreen.id -join ', ')" }
 
       - name: Upload sanitized build evidence
         if: ${{ always() }}
@@ -85,11 +107,11 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-      - name: Upload final runtime ZIP
-        if: ${{ success() }}
+      - name: Upload attested private candidate
+        if: ${{ success() && steps.verify.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: runtime-${{ matrix.backend }}-${{ github.run_id }}
+          name: candidate-${{ matrix.backend }}-${{ github.run_id }}
           path: ${{ steps.build.outputs.zip_path }}
           if-no-files-found: error
           retention-days: 7

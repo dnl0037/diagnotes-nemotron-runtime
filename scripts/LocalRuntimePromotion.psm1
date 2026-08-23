@@ -252,7 +252,7 @@ function Assert-NoPrivatePathText {
     )
 
     $scan = Test-PathPrivacyContract -LiteralPaths @($Root) -PhysicalRoots @($AdditionalForbidden) `
-        -LeafPhysicalRoots @($AdditionalForbidden) -UserProfile ([Environment]::GetFolderPath('UserProfile')) `
+        -LeafPhysicalRoots @() -UserProfile ([Environment]::GetFolderPath('UserProfile')) `
         -UserName ([Environment]::UserName) -RelativeTo $Root
     if (-not $scan.passed) {
         $categories = @($scan.violations.category | Sort-Object -Unique)

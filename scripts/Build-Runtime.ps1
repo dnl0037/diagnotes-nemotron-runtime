@@ -454,7 +454,11 @@ $requiredCache = @(
 )
 foreach ($entry in $requiredCache) { if ($cache -notmatch [regex]::Escape($entry)) { throw "CMake cache lacks $entry" } }
 if ($cache -match 'CMAKE_CUDA_ARCHITECTURES:[^=]*=(native|86)$') { throw 'CUDA architecture cache is incomplete or native.' }
-if ($cache -notmatch "(?m)^VCPKG_TARGET_TRIPLET:[^=]+=$([regex]::Escape($VcpkgTriplet))$") {
+$tripletCandidatePattern = '(?:\A|(?<=[\r\n]))[ \t]*VCPKG_TARGET_TRIPLET(?=[^A-Za-z0-9_]|\z)'
+$tripletExactPattern = "(?:\A|(?<=\n))VCPKG_TARGET_TRIPLET:STRING=$([regex]::Escape($VcpkgTriplet))(?:\r?\n|\z)"
+$tripletCandidateCount = [regex]::Matches($cache, $tripletCandidatePattern).Count
+$tripletExactCount = [regex]::Matches($cache, $tripletExactPattern).Count
+if ($tripletCandidateCount -ne 1 -or $tripletExactCount -ne 1) {
     throw 'CMake cache does not prove the required x64-windows-static-md triplet.'
 }
 if ($cache -match '(?m)^CMAKE_MSVC_RUNTIME_LIBRARY:[^=]+=MultiThreaded$') {

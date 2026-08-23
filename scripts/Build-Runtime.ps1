@@ -398,18 +398,21 @@ if ($Backend -eq 'cuda') {
 }
 
 $upstreamBuild = Join-Path $SourceRoot 'scripts\windows\build.ps1'
-$buildArgs = @(
-    '-Backend', $Backend,
-    '-Profile', 'asr',
-    '-Http',
-    '-Config', $Configuration,
-    '-BuildDir', $BuildRoot,
-    '-VcpkgTriplet', $VcpkgTriplet,
-    '-Architecture', 'x64',
-    '-Compiler', 'msvc',
-    '-Jobs', '4'
-)
-if ($Backend -eq 'cuda') { $buildArgs += @('-CudaArch', $CudaArch, '-CublasShim') }
+$buildArgs = @{
+    Backend = $Backend
+    Profile = 'asr'
+    Http = $true
+    Config = $Configuration
+    BuildDir = $BuildRoot
+    VcpkgTriplet = $VcpkgTriplet
+    Architecture = 'x64'
+    Compiler = 'msvc'
+    Jobs = 4
+}
+if ($Backend -eq 'cuda') {
+    $buildArgs['CudaArch'] = $CudaArch
+    $buildArgs['CublasShim'] = $true
+}
 # Run upstream in-process so its vcvars64 import remains available for the
 # contracted ASR+HTTP-only reconfigure below. A child pwsh discards INCLUDE,
 # LIB, and LIBPATH on exit and makes the otherwise valid MSVC build non-repeatable.

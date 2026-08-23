@@ -10,7 +10,7 @@ jobs:
   build:
     name: candidate-${{ matrix.backend }}
     runs-on: windows-2022
-    timeout-minutes: 55
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

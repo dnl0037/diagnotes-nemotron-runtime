@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$BuildScriptPath = (Join-Path $PSScriptRoot 'Build-Runtime.ps1'),
+    [string]$CandidateTestPath = (Join-Path $PSScriptRoot 'Test-RuntimeCandidate.ps1'),
     [string]$WorkflowPath = (Join-Path (Split-Path -Parent $PSScriptRoot) '.github\workflows\build-release.yml'),
     [string]$EvidencePath,
     [ValidateSet('Preflight','FinalizeAttestation')]
@@ -108,7 +109,22 @@ try {
     if (@($parseErrors).Count -ne 0) { throw 'BUILD_SCRIPT_PARSE' }
 
     $functionNames = @(
+        'Get-ProcessEnvironmentMap',
+        'Restore-ProcessEnvironmentMap',
+        'Test-GitHubActionsEnvironment',
+        'Resolve-ValidatedLocalWorkRoot',
+        'Resolve-LocalBuildTools',
+        'Resolve-MsvcRedistFromCacheContract',
+        'Get-CudaComponentFileMap',
+        'Test-LocalCudaReuseProof',
+        'Resolve-CudaToolkitLicensePath',
+        'Resolve-CudaRuntimeDependencyPath',
+        'Get-ProcessEnvironmentVariableState',
+        'Restore-ProcessEnvironmentVariableState',
+        'Test-GgmlPatchSeriesContract',
         'ConvertTo-SanitizedEvidenceText',
+        'Test-EvidenceTextPrivacyContract',
+        'Get-EvidencePrivacyViolations',
         'New-UpstreamBuildArguments',
         'Test-RuntimeIdentityContract',
         'New-ProfileArguments',
@@ -118,9 +134,13 @@ try {
         'ConvertFrom-ExactKeyValueText',
         'Test-CudaVersionJson',
         'Test-NvccVersionText',
+        'ConvertTo-ShortMsvcVersionString',
+        'Get-MsvcVersionText',
         'Test-MicrosoftSignerIdentity',
         'Test-MsvcRedistFileContract',
         'Test-IsAllowedMsvcRedistributableName',
+        'Resolve-MsvcRedistSourcePath',
+        'Remove-PreinstalledMsvcRedistributables',
         'ConvertFrom-DumpbinDependentsText',
         'Get-RuntimeFileClassification',
         'Test-RuntimeBinaryProfile',
@@ -129,6 +149,8 @@ try {
         'ConvertTo-CanonicalRuntimeRecordMap',
         'Test-PayloadMetadataClosure',
         'Test-MsvcRedistClosureContract',
+        'New-WindowsSystemDllSet',
+        'Resolve-PeClosure',
         'ConvertFrom-WindowsCommandLine',
         'Test-CompileCommandsContract',
         'Get-RuntimeGateManifest',
@@ -157,6 +179,44 @@ try {
         ObservedVcpkgCommit='9e593bb18ea69cc5095e012465dcd675a822ed0d'
     }
     Add-CaseResult -Group identity-mutation -Name green -Passed (Test-RuntimeIdentityContract @identityGreen).passed
+
+    $WorkRoot = 'C:\Users\PrivacyFixture\RuntimeBuild'
+    $jsonEscapedWorkRoot = $WorkRoot.Replace('\', '\\')
+    $sanitizedRawPrivatePath = ConvertTo-SanitizedEvidenceText -Content "$WorkRoot\source\one.cpp"
+    $sanitizedJsonPrivatePath = ConvertTo-SanitizedEvidenceText -Content ('{"directory":"' + $jsonEscapedWorkRoot + '\\source"}')
+    Add-CaseResult -Group evidence-privacy -Name raw-private-path-sanitized-green -Passed (
+        $sanitizedRawPrivatePath -ceq '<private-path>\source\one.cpp' -and
+        (Test-EvidenceTextPrivacyContract -Content $sanitizedRawPrivatePath)
+    )
+    Add-CaseResult -Group evidence-privacy -Name json-escaped-private-path-sanitized-green -Passed (
+        $sanitizedJsonPrivatePath -ceq '{"directory":"<private-path>\\source"}' -and
+        (Test-EvidenceTextPrivacyContract -Content $sanitizedJsonPrivatePath)
+    )
+    foreach ($privacyRed in @(
+        [pscustomobject]@{ name='raw-private-path-red'; text='C:\Users\fixture\one.log' },
+        [pscustomobject]@{ name='json-escaped-private-path-red'; text='{"directory":"C:\\Users\\fixture\\source"}' },
+        [pscustomobject]@{ name='json-escaped-case-insensitive-red'; text='{"directory":"c:\\uSeRs\\fixture\\source"}' }
+    )) {
+        Add-CaseResult -Group evidence-privacy -Name $privacyRed.name -Passed (-not (Test-EvidenceTextPrivacyContract -Content $privacyRed.text))
+    }
+    Add-CaseResult -Group evidence-privacy -Name users-neighbor-green -Passed (Test-EvidenceTextPrivacyContract -Content '{"directory":"C:\\UsersX\\fixture"}')
+    $privacyDirectoryProbe = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-evidence-privacy-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $privacyDirectoryProbe | Out-Null
+        $buildResultProbe = Join-Path $privacyDirectoryProbe 'build-result.json'
+        [IO.File]::WriteAllText($buildResultProbe, '{"gate_results":"gate-results.json"}', [Text.UTF8Encoding]::new($false))
+        Add-CaseResult -Group evidence-privacy -Name post-build-portable-result-green -Passed (@(Get-EvidencePrivacyViolations -Root $privacyDirectoryProbe).Count -eq 0)
+        [IO.File]::WriteAllText($buildResultProbe, '{"gate_results":"C:\Users\fixture\gate-results.json"}', [Text.UTF8Encoding]::new($false))
+        Add-CaseResult -Group evidence-privacy -Name post-build-raw-path-red -Passed ((@(Get-EvidencePrivacyViolations -Root $privacyDirectoryProbe) | ConvertTo-Json -Compress) -ceq (@('build-result.json') | ConvertTo-Json -Compress))
+        [IO.File]::WriteAllText($buildResultProbe, '{"gate_results":"C:\\Users\\fixture\\gate-results.json"}', [Text.UTF8Encoding]::new($false))
+        Add-CaseResult -Group evidence-privacy -Name post-build-escaped-path-red -Passed ((@(Get-EvidencePrivacyViolations -Root $privacyDirectoryProbe) | ConvertTo-Json -Compress) -ceq (@('build-result.json') | ConvertTo-Json -Compress))
+    } finally {
+        $resolvedPrivacyProbe = [IO.Path]::GetFullPath($privacyDirectoryProbe)
+        $privacyProbePrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-evidence-privacy-'
+        if ($resolvedPrivacyProbe.StartsWith($privacyProbePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedPrivacyProbe) { Remove-Item -LiteralPath $resolvedPrivacyProbe -Recurse -Force }
+        } else { throw 'Evidence privacy probe cleanup boundary failed.' }
+    }
     foreach ($identityMutation in @(
         [pscustomobject]@{name='source';key='ObservedSourceCommit';value='0000000000000000000000000000000000000000'},
         [pscustomobject]@{name='patch-sha';key='ObservedPatchSha256';value=('0' * 64)},
@@ -185,6 +245,7 @@ try {
         'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON',
         'CMAKE_TOOLCHAIN_FILE:FILEPATH=C:/vcpkg/scripts/buildsystems/vcpkg.cmake',
         'CMAKE_CXX_COMPILER:FILEPATH=C:/VS/cl.exe',
+        'MSVC_REDIST_DIR:PATH=C:/VS/VC/Redist/MSVC/14.44.35112',
         'CMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL',
         'CMAKE_CUDA_ARCHITECTURES:STRING=75;80;86;89'
     )
@@ -215,6 +276,10 @@ try {
         export_duplicate = $baseCacheLines + 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON'
         malformed = $baseCacheLines -replace '^CMAKE_TOOLCHAIN_FILE:', 'CMAKE_TOOLCHAIN_FILE :'
         bare_cr = @($baseCacheLines[0..4] + ("$($baseCacheLines[5])`r$($baseCacheLines[6])") + $baseCacheLines[7..($baseCacheLines.Count - 1)])
+        redist_missing = @($baseCacheLines | Where-Object { $_ -notmatch '^MSVC_REDIST_DIR:' })
+        redist_duplicate = $baseCacheLines + 'MSVC_REDIST_DIR:PATH=C:/VS/VC/Redist/MSVC/14.44.35112'
+        redist_wrong_type = $baseCacheLines -replace '^MSVC_REDIST_DIR:PATH=', 'MSVC_REDIST_DIR:FILEPATH='
+        redist_relative = $baseCacheLines -replace '^MSVC_REDIST_DIR:PATH=.*$', 'MSVC_REDIST_DIR:PATH=VC/Redist/MSVC/14.44.35112'
     }
     foreach ($mutation in $cacheMutations.GetEnumerator()) {
         $actual = Test-CMakeCacheContract -Text ($mutation.Value -join "`n") -RequestedBackend cuda -RequestedTriplet 'x64-windows-static-md' -RequestedCudaArch '75;80;86;89'
@@ -306,6 +371,148 @@ try {
         }
         if (Test-Path -LiteralPath $environmentScript) { Remove-Item -LiteralPath $environmentScript -Force }
     }
+    $fullEnvironmentBefore = Get-ProcessEnvironmentMap
+    try {
+        $env:DIAGNOTES_ENVIRONMENT_PROBE = [Guid]::NewGuid().ToString('N')
+        $env:Path = "diagnotes-mutated;$env:Path"
+        $env:CUDA_PATH = 'diagnotes-cuda-sentinel'
+    } finally {
+        Restore-ProcessEnvironmentMap -Snapshot $fullEnvironmentBefore
+    }
+    $fullEnvironmentAfter = Get-ProcessEnvironmentMap
+    Add-CaseResult -Group environment-full -Name exact-map-restored -Passed (($fullEnvironmentAfter | ConvertTo-Json -Compress) -ceq ($fullEnvironmentBefore | ConvertTo-Json -Compress))
+
+    $rootProbeContainer = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-local-root-' + [Guid]::NewGuid().ToString('N'))
+    $rootProbeExternal = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-local-root-external-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $rootProbeBase = Join-Path $rootProbeContainer 'DiagNotes\RuntimeBuild'
+        New-Item -ItemType Directory -Force -Path $rootProbeBase,$rootProbeExternal | Out-Null
+        $validRoot = Join-Path $rootProbeBase 'valid-run'
+        Add-CaseResult -Group local-root -Name strict-child-green -Passed ((Resolve-ValidatedLocalWorkRoot -RequestedRoot $validRoot -LocalAppDataRoot $rootProbeContainer).root -ceq [IO.Path]::GetFullPath($validRoot))
+        foreach ($invalidRoot in @($rootProbeBase,(Join-Path $rootProbeContainer 'outside'),(Join-Path $rootProbeBase '..\escape'),'relative\run','\\server\share\run','\\?\C:\escape')) {
+            $rejected = $false
+            try { [void](Resolve-ValidatedLocalWorkRoot -RequestedRoot $invalidRoot -LocalAppDataRoot $rootProbeContainer) } catch { $rejected = $true }
+            Add-CaseResult -Group local-root -Name ('reject-' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($invalidRoot))).Substring(0,8)) -Passed $rejected
+        }
+        $junction = Join-Path $rootProbeBase 'junction'
+        New-Item -ItemType Junction -Path $junction -Target $rootProbeExternal | Out-Null
+        $junctionRejected = $false
+        try { [void](Resolve-ValidatedLocalWorkRoot -RequestedRoot (Join-Path $junction 'run') -LocalAppDataRoot $rootProbeContainer) } catch { $junctionRejected = $true }
+        Add-CaseResult -Group local-root -Name reparse-parent-red -Passed $junctionRejected
+        Remove-Item -LiteralPath $junction -Force
+        $externalBase = Join-Path $rootProbeExternal 'escaped-base'
+        New-Item -ItemType Directory -Path $externalBase | Out-Null
+        Remove-Item -LiteralPath $rootProbeBase -Force
+        New-Item -ItemType Junction -Path $rootProbeBase -Target $externalBase | Out-Null
+        $baseJunctionRejected = $false
+        try { [void](Resolve-ValidatedLocalWorkRoot -RequestedRoot (Join-Path $rootProbeBase 'run') -LocalAppDataRoot $rootProbeContainer) } catch { $baseJunctionRejected = $true }
+        Add-CaseResult -Group local-root -Name reparse-base-red -Passed $baseJunctionRejected
+    } finally {
+        foreach ($probe in @($rootProbeContainer,$rootProbeExternal)) {
+            $resolvedProbe = [IO.Path]::GetFullPath($probe)
+            $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+            if ($resolvedProbe.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($resolvedProbe).StartsWith('diagnotes-local-root-', [StringComparison]::Ordinal)) {
+                if (Test-Path -LiteralPath $resolvedProbe) { Remove-Item -LiteralPath $resolvedProbe -Recurse -Force }
+            } else { throw 'Local root probe cleanup boundary failed.' }
+        }
+    }
+
+    $expectedSystemDllNames = @(
+        'ADVAPI32.dll','BCRYPT.dll','BCRYPTPRIMITIVES.dll','CABINET.dll','CFGMGR32.dll','COMCTL32.dll','COMDLG32.dll',
+        'CRYPT32.dll','DBGHELP.dll','DNSAPI.dll','GDI32.dll','IMM32.dll','IPHLPAPI.dll','KERNEL32.dll','MSWSOCK.dll',
+        'NETAPI32.dll','NORMALIZ.dll','NTDLL.dll','OLE32.dll','OLEAUT32.dll','POWRPROF.dll','PSAPI.dll','RPCRT4.dll',
+        'SECUR32.dll','SETUPAPI.dll','SHELL32.dll','SHLWAPI.dll','USER32.dll','USERENV.dll','UCRTBASE.dll','VERSION.dll',
+        'WINHTTP.dll','WINMM.dll','WS2_32.dll','WTSAPI32.dll'
+    )
+    $expectedSystemDlls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $expectedSystemDllNames) { [void]$expectedSystemDlls.Add($name) }
+    $systemDlls = New-WindowsSystemDllSet
+    Add-CaseResult -Group system-dll-boundary -Name exact-baseline-plus-dbghelp -Passed (
+        $systemDlls.Count -eq 35 -and $systemDlls.SetEquals($expectedSystemDlls) -and
+        $systemDlls.Comparer.Equals([StringComparer]::OrdinalIgnoreCase)
+    )
+
+    $peBoundaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-pe-dbghelp-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $Backend = 'cpu'
+        function Get-PeDependencies {
+            param([Parameter(Mandatory)][string]$Path)
+            return @($script:PeDependencyFixture)
+        }
+        foreach ($allowCopy in @($true,$false)) {
+            $modeName = if ($allowCopy) { 'copy' } else { 'recheck' }
+            foreach ($fixture in @(
+                [pscustomobject]@{name='dbghelp-green';dependency='DBGHELP.DLL';expected=$true},
+                [pscustomobject]@{name='dbgcore-red';dependency='dbgcore.dll';expected=$false},
+                [pscustomobject]@{name='dbghelp32-red';dependency='dbghelp32.dll';expected=$false}
+            )) {
+                $probeRoot = Join-Path $peBoundaryRoot ($modeName + '-' + $fixture.name)
+                $probeBin = Join-Path $probeRoot 'bin'
+                New-Item -ItemType Directory -Force -Path $probeBin | Out-Null
+                [IO.File]::WriteAllBytes((Join-Path $probeBin 'nemo_speech_asr.dll'), [byte[]](1,2,3,4))
+                $before = @(Get-RuntimeTreeRecords -Root $probeRoot) | ConvertTo-Json -Depth 5 -Compress
+                $script:PeDependencyFixture = $fixture.dependency
+                $threw = $false
+                $message = ''
+                $result = $null
+                try { $result = Resolve-PeClosure -Root $probeRoot -AllowMsvcCopy $allowCopy }
+                catch { $threw = $true; $message = $_.Exception.Message }
+                $after = @(Get-RuntimeTreeRecords -Root $probeRoot) | ConvertTo-Json -Depth 5 -Compress
+                $passed = if ($fixture.expected) {
+                    -not $threw -and @($result.edges).Count -eq 1 -and
+                    [string]$result.edges[0].dependency -ceq 'DBGHELP.DLL' -and
+                    [string]$result.edges[0].classification -ceq 'windows-system' -and
+                    @($result.copied_msvc).Count -eq 0 -and $before -ceq $after
+                } else {
+                    $threw -and $message -ceq "Unresolved non-system PE dependency: $($fixture.dependency)" -and $before -ceq $after
+                }
+                Add-CaseResult -Group system-dll-boundary -Name ($modeName + '-' + $fixture.name) -Passed $passed
+            }
+        }
+    } finally {
+        Remove-Item Function:Get-PeDependencies -ErrorAction SilentlyContinue
+        Remove-Variable PeDependencyFixture -Scope Script -ErrorAction SilentlyContinue
+        $resolvedPeBoundary = [IO.Path]::GetFullPath($peBoundaryRoot)
+        $peBoundaryPrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-pe-dbghelp-'
+        if ($resolvedPeBoundary.StartsWith($peBoundaryPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedPeBoundary) { Remove-Item -LiteralPath $resolvedPeBoundary -Recurse -Force }
+        } else { throw 'PE DbgHelp probe cleanup boundary failed.' }
+    }
+
+    $repoRootForProbe = Split-Path -Parent $PSScriptRoot
+    $repoStatusBefore = @(git -C $repoRootForProbe status --porcelain=v1 --untracked-files=all) -join "`n"
+    $guardRoot = Join-Path $env:LOCALAPPDATA ('DiagNotes\RuntimeBuild\guard-' + [Guid]::NewGuid().ToString('N'))
+    $noLocalOutput = (& pwsh -NoLogo -NoProfile -NonInteractive -File $resolvedBuild -Backend cpu 2>&1 | Out-String)
+    $noLocalExit = $LASTEXITCODE
+    Add-CaseResult -Group entrypoint-guard -Name nonlocal-outside-github-red -Passed ($noLocalExit -ne 0 -and $noLocalOutput -match 'requires a coherent GitHub Actions environment')
+    $guardEnvironment = Get-ProcessEnvironmentMap
+    try {
+        $env:GITHUB_ACTIONS='true'; $env:GITHUB_RUN_ID='1'; $env:GITHUB_RUN_ATTEMPT='1'; $env:GITHUB_WORKSPACE='C:\runner\work'; $env:GITHUB_SHA=('a' * 40); $env:RUNNER_TEMP='C:\runner\temp'
+        $localGithubOutput = (& pwsh -NoLogo -NoProfile -NonInteractive -File $resolvedBuild -Backend cpu -Local -LocalWorkRoot $guardRoot 2>&1 | Out-String)
+        $localGithubExit = $LASTEXITCODE
+    } finally { Restore-ProcessEnvironmentMap -Snapshot $guardEnvironment }
+    Add-CaseResult -Group entrypoint-guard -Name local-under-github-red -Passed ($localGithubExit -ne 0 -and $localGithubOutput -match 'Local mode is forbidden')
+    $markerEnvironment = Get-ProcessEnvironmentMap
+    try {
+        $env:GITHUB_TOKEN = 'fixture-only'
+        $localMarkerOutput = (& pwsh -NoLogo -NoProfile -NonInteractive -File $resolvedBuild -Backend cpu -Local -LocalWorkRoot $guardRoot 2>&1 | Out-String)
+        $localMarkerExit = $LASTEXITCODE
+    } finally { Restore-ProcessEnvironmentMap -Snapshot $markerEnvironment }
+    Add-CaseResult -Group entrypoint-guard -Name local-under-any-github-marker-red -Passed ($localMarkerExit -ne 0 -and $localMarkerOutput -match 'Local mode is forbidden')
+    Add-CaseResult -Group entrypoint-guard -Name no-root-created -Passed (-not (Test-Path -LiteralPath $guardRoot))
+    $repoStatusAfter = @(git -C $repoRootForProbe status --porcelain=v1 --untracked-files=all) -join "`n"
+    Add-CaseResult -Group entrypoint-guard -Name repo-untouched -Passed ($repoStatusAfter -ceq $repoStatusBefore)
+    if ($env:GITHUB_ACTIONS -cne 'true') {
+        $vsWhereProbe = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        $localToolsProbe = Resolve-LocalBuildTools -VsWherePath $vsWhereProbe
+        Add-CaseResult -Group local-toolchain -Name build-tools-17-14 -Passed ($localToolsProbe.product_display_version -match '^17\.14\.' -and $localToolsProbe.toolset_version -ceq '14.44.35207')
+        Add-CaseResult -Group local-toolchain -Name cmake-ninja-cl-dumpbin -Passed (@($localToolsProbe.cmake,$localToolsProbe.ninja,$localToolsProbe.cl,$localToolsProbe.dumpbin | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0)
+        $actualMsvcVersion = Get-MsvcVersionText -ClPath $localToolsProbe.cl -ExpectedToolsetVersion $localToolsProbe.toolset_version
+        Add-CaseResult -Group local-toolchain -Name msvc-version-short-string -Passed (
+            $actualMsvcVersion.GetType() -eq [string] -and $actualMsvcVersion -match '^19\.44\.[0-9]{1,5}$' -and
+            $actualMsvcVersion.Length -le 15 -and $actualMsvcVersion -notmatch "[`r`n]"
+        )
+    }
 
     $cpuArgs = New-UpstreamBuildArguments -RequestedBackend cpu -RequestedConfiguration Release -RequestedBuildRoot B -RequestedTriplet x64-windows-static-md -RequestedCudaArch '75;80;86;89'
     $cudaArgs = New-UpstreamBuildArguments -RequestedBackend cuda -RequestedConfiguration Release -RequestedBuildRoot B -RequestedTriplet x64-windows-static-md -RequestedCudaArch '75;80;86;89'
@@ -325,9 +532,220 @@ try {
         '-DNEMO_SPEECH_BUILD_EXAMPLES=OFF','-DNEMO_SPEECH_BUILD_TOOLS=OFF'
     )
     $expectedCpuProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=OFF','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_GGML_PATCHED=OFF'))
-    $expectedCudaProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=ON','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_CUBLAS_SHIM=ON','-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89'))
+    $expectedCudaProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=ON','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_CUBLAS_SHIM=ON','-DCMAKE_CUDA_ARCHITECTURES:STRING=75;80;86;89'))
     Add-CaseResult -Group semantic-diff -Name 'cpu-baseline-plus-export-only' -Passed (($cpuProfile | ConvertTo-Json -Compress) -ceq ($expectedCpuProfile | ConvertTo-Json -Compress))
     Add-CaseResult -Group semantic-diff -Name 'cuda-baseline-plus-export-only' -Passed (($cudaProfile | ConvertTo-Json -Compress) -ceq ($expectedCudaProfile | ConvertTo-Json -Compress))
+    Add-CaseResult -Group semantic-diff -Name 'cuda-architectures-retyped-string' -Passed (
+        $cudaProfile -ccontains '-DCMAKE_CUDA_ARCHITECTURES:STRING=75;80;86;89' -and
+        $cudaProfile -cnotcontains '-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89'
+    )
+
+    $cudaLicenseProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-cuda-license-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $cudaLicenseProbeRoot | Out-Null
+        $licenseFixtureBytes = [Text.Encoding]::UTF8.GetBytes("End User License Agreement`nfixture`n")
+        $licenseFixtureHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($licenseFixtureBytes))
+        $licensePath = Join-Path $cudaLicenseProbeRoot 'LICENSE'
+        [IO.File]::WriteAllBytes($licensePath, $licenseFixtureBytes)
+        $licenseContract = Resolve-CudaToolkitLicensePath -CudaRoot $cudaLicenseProbeRoot -ExpectedSha256 $licenseFixtureHash
+        Add-CaseResult -Group cuda-license -Name 'license-name-green' -Passed ($licenseContract.name -ceq 'LICENSE' -and $licenseContract.sha256 -ceq $licenseFixtureHash)
+        [IO.File]::WriteAllBytes($licensePath, [Text.Encoding]::UTF8.GetBytes("tampered`n"))
+        $tamperedLicenseRejected = $false
+        try { [void](Resolve-CudaToolkitLicensePath -CudaRoot $cudaLicenseProbeRoot -ExpectedSha256 $licenseFixtureHash) } catch { $tamperedLicenseRejected = $true }
+        Add-CaseResult -Group cuda-license -Name 'tampered-red' -Passed $tamperedLicenseRejected
+        Remove-Item -LiteralPath $licensePath -Force
+        $missingLicenseRejected = $false
+        try { [void](Resolve-CudaToolkitLicensePath -CudaRoot $cudaLicenseProbeRoot -ExpectedSha256 $licenseFixtureHash) } catch { $missingLicenseRejected = $true }
+        Add-CaseResult -Group cuda-license -Name 'missing-red' -Passed $missingLicenseRejected
+        $eulaPath = Join-Path $cudaLicenseProbeRoot 'EULA.txt'
+        [IO.File]::WriteAllBytes($eulaPath, $licenseFixtureBytes)
+        $eulaContract = Resolve-CudaToolkitLicensePath -CudaRoot $cudaLicenseProbeRoot -ExpectedSha256 $licenseFixtureHash
+        Add-CaseResult -Group cuda-license -Name 'legacy-eula-name-green' -Passed ($eulaContract.name -ceq 'EULA.txt' -and $eulaContract.sha256 -ceq $licenseFixtureHash)
+        [IO.File]::WriteAllBytes($licensePath, $licenseFixtureBytes)
+        $ambiguousLicenseRejected = $false
+        try { [void](Resolve-CudaToolkitLicensePath -CudaRoot $cudaLicenseProbeRoot -ExpectedSha256 $licenseFixtureHash) } catch { $ambiguousLicenseRejected = $true }
+        Add-CaseResult -Group cuda-license -Name 'duplicate-path-red' -Passed $ambiguousLicenseRejected
+    } finally {
+        $resolvedCudaLicenseProbe = [IO.Path]::GetFullPath($cudaLicenseProbeRoot)
+        $cudaLicenseProbePrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-cuda-license-'
+        if ($resolvedCudaLicenseProbe.StartsWith($cudaLicenseProbePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedCudaLicenseProbe) { Remove-Item -LiteralPath $resolvedCudaLicenseProbe -Recurse -Force }
+        } else { throw 'CUDA license probe cleanup boundary failed.' }
+    }
+
+    $cudaClosureProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-cuda-closure-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $cudaFixtureRoot = Join-Path $cudaClosureProbeRoot 'toolkit'
+        $cudaFixtureBin = Join-Path $cudaFixtureRoot 'bin'
+        New-Item -ItemType Directory -Path $cudaFixtureBin | Out-Null
+        $cudaFixtureSource = Join-Path $cudaFixtureBin 'cudart64_12.dll'
+        [IO.File]::WriteAllBytes($cudaFixtureSource, [byte[]](1,2,3,4,5))
+        Add-CaseResult -Group cuda-pe-closure -Name 'exact-source-green' -Passed ((Resolve-CudaRuntimeDependencyPath -Name 'CUDART64_12.DLL' -CudaRoot $cudaFixtureRoot) -ceq $cudaFixtureSource)
+        foreach ($cudaNeighbor in @('cudart64_11.dll','cudart64_12d.dll','nvcuda.dll','cudart64_12.dll.bak')) {
+            $neighborRejected = $false
+            try { [void](Resolve-CudaRuntimeDependencyPath -Name $cudaNeighbor -CudaRoot $cudaFixtureRoot) } catch { $neighborRejected = $true }
+            Add-CaseResult -Group cuda-pe-closure -Name ($cudaNeighbor + '-red') -Passed $neighborRejected
+        }
+
+        $Backend = 'cuda'
+        function Get-PeDependencies {
+            param([Parameter(Mandatory)][string]$Path)
+            if ([IO.Path]::GetFileName($Path) -ceq 'nemo_speech_asr.dll') { return @($script:CudaPeDependencyFixture) }
+            return @()
+        }
+        $cudaCopyRoot = Join-Path $cudaClosureProbeRoot 'copy'
+        $cudaCopyBin = Join-Path $cudaCopyRoot 'bin'
+        New-Item -ItemType Directory -Path $cudaCopyBin | Out-Null
+        [IO.File]::WriteAllBytes((Join-Path $cudaCopyBin 'nemo_speech_asr.dll'), [byte[]](9,8,7))
+        $script:CudaPeDependencyFixture = 'cudart64_12.dll'
+        $cudaCopyClosure = Resolve-PeClosure -Root $cudaCopyRoot -AllowMsvcCopy $true -CudaRoot $cudaFixtureRoot
+        $copiedCudaPath = Join-Path $cudaCopyBin 'cudart64_12.dll'
+        Add-CaseResult -Group cuda-pe-closure -Name 'copy-imported-runtime-green' -Passed (
+            (Test-Path -LiteralPath $copiedCudaPath -PathType Leaf) -and
+            (Get-FileHash -LiteralPath $copiedCudaPath -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $cudaFixtureSource -Algorithm SHA256).Hash -and
+            @($cudaCopyClosure.copied_cuda).Count -eq 1 -and
+            [string]$cudaCopyClosure.edges[0].classification -ceq 'nvidia-cuda-runtime-app-local'
+        )
+        $cudaRecheckClosure = Resolve-PeClosure -Root $cudaCopyRoot -AllowMsvcCopy $false -CudaRoot $cudaFixtureRoot
+        Add-CaseResult -Group cuda-pe-closure -Name 'zip-recheck-green' -Passed (@($cudaRecheckClosure.copied_cuda).Count -eq 0 -and [string]$cudaRecheckClosure.edges[0].classification -ceq 'app-local')
+
+        $cudaMissingRoot = Join-Path $cudaClosureProbeRoot 'missing'
+        $cudaMissingBin = Join-Path $cudaMissingRoot 'bin'
+        New-Item -ItemType Directory -Path $cudaMissingBin | Out-Null
+        [IO.File]::WriteAllBytes((Join-Path $cudaMissingBin 'nemo_speech_asr.dll'), [byte[]](9,8,7))
+        $missingCopyRejected = $false
+        try { [void](Resolve-PeClosure -Root $cudaMissingRoot -AllowMsvcCopy $false -CudaRoot $cudaFixtureRoot) } catch { $missingCopyRejected = $_.Exception.Message -ceq 'Clean ZIP extraction lacks an app-local CUDA runtime dependency.' }
+        Add-CaseResult -Group cuda-pe-closure -Name 'zip-missing-runtime-red' -Passed $missingCopyRejected
+    } finally {
+        Remove-Item Function:Get-PeDependencies -ErrorAction SilentlyContinue
+        Remove-Variable CudaPeDependencyFixture -Scope Script -ErrorAction SilentlyContinue
+        $resolvedCudaClosureProbe = [IO.Path]::GetFullPath($cudaClosureProbeRoot)
+        $cudaClosureProbePrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-cuda-closure-'
+        if ($resolvedCudaClosureProbe.StartsWith($cudaClosureProbePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedCudaClosureProbe) { Remove-Item -LiteralPath $resolvedCudaClosureProbe -Recurse -Force }
+        } else { throw 'CUDA closure probe cleanup boundary failed.' }
+    }
+
+    $ggmlSeriesProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-ggml-contract-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $ggmlSeriesRepo = Join-Path $ggmlSeriesProbeRoot 'ggml'
+        $ggmlSeriesPatches = Join-Path $ggmlSeriesProbeRoot 'patches'
+        New-Item -ItemType Directory -Path $ggmlSeriesRepo,$ggmlSeriesPatches | Out-Null
+        & git -C $ggmlSeriesRepo init --quiet 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize ggml contract fixture.' }
+        $ggmlFixtureFile = Join-Path $ggmlSeriesRepo 'fixture.txt'
+        [IO.File]::WriteAllText($ggmlFixtureFile, "alpha`n", [Text.UTF8Encoding]::new($false))
+        & git -C $ggmlSeriesRepo add -- fixture.txt 2>$null
+        & git -C $ggmlSeriesRepo -c user.name=DiagNotesFixture -c user.email=fixture.invalid@example.invalid commit --quiet -m base 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to commit ggml contract fixture.' }
+        $ggmlFixtureCommit = (& git -C $ggmlSeriesRepo rev-parse HEAD 2>$null | Out-String).Trim()
+        [IO.File]::WriteAllText($ggmlFixtureFile, "alpha`nbeta`n", [Text.UTF8Encoding]::new($false))
+        $ggmlFixturePatchText = (& git -C $ggmlSeriesRepo diff -- fixture.txt 2>$null | Out-String).Replace("`r", '')
+        $ggmlFixturePatch = Join-Path $ggmlSeriesPatches '0001-fixture.patch'
+        [IO.File]::WriteAllText($ggmlFixturePatch, $ggmlFixturePatchText, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($ggmlFixtureFile, "alpha`n", [Text.UTF8Encoding]::new($false))
+
+        $cleanTreeContract = Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1
+        Add-CaseResult -Group ggml-patch-series -Name 'clean-tree-with-missing-series-red' -Passed (-not $cleanTreeContract.passed)
+        & git -C $ggmlSeriesRepo apply -- $ggmlFixturePatch 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to apply ggml contract fixture patch.' }
+        $exactTreeContract = Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1
+        Add-CaseResult -Group ggml-patch-series -Name 'exact-series-green' -Passed (
+            $exactTreeContract.passed -and $exactTreeContract.patch_count -eq 1 -and
+            $exactTreeContract.expected_tree -ceq $exactTreeContract.current_tree -and
+            (@($exactTreeContract.changed_paths) | ConvertTo-Json -Compress) -ceq (@('fixture.txt') | ConvertTo-Json -Compress)
+        )
+        [IO.File]::WriteAllText((Join-Path $ggmlSeriesRepo 'unexpected.txt'), "unexpected`n", [Text.UTF8Encoding]::new($false))
+        Add-CaseResult -Group ggml-patch-series -Name 'extra-path-red' -Passed (-not (Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1).passed)
+        Remove-Item -LiteralPath (Join-Path $ggmlSeriesRepo 'unexpected.txt') -Force
+        Add-CaseResult -Group ggml-patch-series -Name 'commit-mismatch-red' -Passed (-not (Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit ('f' * 40) -ExpectedPatchCount 1).passed)
+        Add-CaseResult -Group ggml-patch-series -Name 'cardinality-red' -Passed (-not (Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 2).passed)
+        $misnumberedDirectory = Join-Path $ggmlSeriesProbeRoot 'misnumbered'
+        New-Item -ItemType Directory -Path $misnumberedDirectory | Out-Null
+        [IO.File]::WriteAllText((Join-Path $misnumberedDirectory '0002-fixture.patch'), $ggmlFixturePatchText, [Text.UTF8Encoding]::new($false))
+        Add-CaseResult -Group ggml-patch-series -Name 'sequence-red' -Passed (-not (Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $misnumberedDirectory -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1).passed)
+
+        $originalGitIndexState = Get-ProcessEnvironmentVariableState -Name 'GIT_INDEX_FILE'
+        try {
+            Remove-Item -LiteralPath Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+            $absentContract = Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1
+            $absentState = Get-ProcessEnvironmentVariableState -Name 'GIT_INDEX_FILE'
+            $absentDiff = @(& git -C $ggmlSeriesRepo diff --name-only 2>$null)
+            Add-CaseResult -Group git-index-restoration -Name 'absent-restored-as-absence-green' -Passed (
+                $absentContract.passed -and -not $absentState.present -and
+                (($absentDiff | ConvertTo-Json -Compress) -ceq (@('fixture.txt') | ConvertTo-Json -Compress))
+            )
+
+            Set-Item -LiteralPath Env:GIT_INDEX_FILE -Value ''
+            $emptyContract = Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1
+            $emptyState = Get-ProcessEnvironmentVariableState -Name 'GIT_INDEX_FILE'
+            $emptyDiff = @(& git -C $ggmlSeriesRepo diff --name-only 2>$null)
+            Add-CaseResult -Group git-index-restoration -Name 'explicit-empty-restored-green' -Passed (
+                $emptyContract.passed -and $emptyState.present -and $emptyState.value -ceq '' -and $emptyDiff.Count -eq 0
+            )
+
+            $priorIndex = Join-Path $ggmlSeriesProbeRoot 'prior.index'
+            Set-Item -LiteralPath Env:GIT_INDEX_FILE -Value $priorIndex
+            & git -C $ggmlSeriesRepo read-tree HEAD 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to create prior git index fixture.' }
+            $valueContract = Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1
+            $valueState = Get-ProcessEnvironmentVariableState -Name 'GIT_INDEX_FILE'
+            $valueDiff = @(& git -C $ggmlSeriesRepo diff --name-only 2>$null)
+            Add-CaseResult -Group git-index-restoration -Name 'prior-value-restored-green' -Passed (
+                $valueContract.passed -and $valueState.present -and $valueState.value -ceq $priorIndex -and
+                (($valueDiff | ConvertTo-Json -Compress) -ceq (@('fixture.txt') | ConvertTo-Json -Compress))
+            )
+
+            $invalidPatchDirectory = Join-Path $ggmlSeriesProbeRoot 'invalid-patch'
+            New-Item -ItemType Directory -Path $invalidPatchDirectory | Out-Null
+            [IO.File]::WriteAllText((Join-Path $invalidPatchDirectory '0001-invalid.patch'), "not a patch`n", [Text.UTF8Encoding]::new($false))
+            Set-Item -LiteralPath Env:GIT_INDEX_FILE -Value $priorIndex
+            $exceptionContract = Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $invalidPatchDirectory -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1
+            $exceptionState = Get-ProcessEnvironmentVariableState -Name 'GIT_INDEX_FILE'
+            $exceptionDiff = @(& git -C $ggmlSeriesRepo diff --name-only 2>$null)
+            Add-CaseResult -Group git-index-restoration -Name 'exception-restores-prior-value-red-green' -Passed (
+                -not $exceptionContract.passed -and $exceptionState.present -and $exceptionState.value -ceq $priorIndex -and
+                (($exceptionDiff | ConvertTo-Json -Compress) -ceq (@('fixture.txt') | ConvertTo-Json -Compress))
+            )
+
+            Remove-Item -LiteralPath Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+            $postExceptionContract = Test-GgmlPatchSeriesContract -GgmlRoot $ggmlSeriesRepo -PatchDirectory $ggmlSeriesPatches -ExpectedCommit $ggmlFixtureCommit -ExpectedPatchCount 1
+            $postExceptionState = Get-ProcessEnvironmentVariableState -Name 'GIT_INDEX_FILE'
+            $postExceptionDiff = @(& git -C $ggmlSeriesRepo diff --name-only 2>$null)
+            Add-CaseResult -Group git-index-restoration -Name 'no-state-leak-to-next-invocation-green' -Passed (
+                $postExceptionContract.passed -and -not $postExceptionState.present -and
+                (($postExceptionDiff | ConvertTo-Json -Compress) -ceq (@('fixture.txt') | ConvertTo-Json -Compress))
+            )
+        } finally {
+            Restore-ProcessEnvironmentVariableState -State $originalGitIndexState
+        }
+    } finally {
+        $resolvedGgmlSeriesProbe = [IO.Path]::GetFullPath($ggmlSeriesProbeRoot)
+        $ggmlSeriesProbePrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-ggml-contract-'
+        if ($resolvedGgmlSeriesProbe.StartsWith($ggmlSeriesProbePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedGgmlSeriesProbe) { Remove-Item -LiteralPath $resolvedGgmlSeriesProbe -Recurse -Force }
+        } else { throw 'ggml contract probe cleanup boundary failed.' }
+    }
+
+    $toolchainProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-profile-toolchain-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $toolchainProbe = Join-Path $toolchainProbeRoot 'vcpkg\scripts\buildsystems\vcpkg.cmake'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $toolchainProbe) | Out-Null
+        [IO.File]::WriteAllText($toolchainProbe, '# fixture', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $toolchainProbeRoot 'CMakeCache.txt'), "CMAKE_TOOLCHAIN_FILE:UNINITIALIZED=$toolchainProbe`n", [Text.UTF8Encoding]::new($false))
+        $reassertedProfile = @(New-ProfileArguments -RequestedBackend cpu -RequestedSourceRoot S -RequestedBuildRoot $toolchainProbeRoot -RequestedCudaArch '75;80;86;89' -ReassertToolchainFromCache)
+        Add-CaseResult -Group semantic-diff -Name 'reused-cache-toolchain-retyped-filepath' -Passed ($reassertedProfile -ccontains "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=$toolchainProbe")
+        $missingCacheRejected = $false
+        try { [void](New-ProfileArguments -RequestedBackend cpu -RequestedSourceRoot S -RequestedBuildRoot (Join-Path $toolchainProbeRoot 'missing') -RequestedCudaArch '75;80;86;89' -ReassertToolchainFromCache) }
+        catch { $missingCacheRejected = $_.Exception.Message -match 'did not materialize CMakeCache\.txt' }
+        Add-CaseResult -Group semantic-diff -Name 'reused-cache-missing-red' -Passed $missingCacheRejected
+    } finally {
+        $resolvedToolchainProbe = [IO.Path]::GetFullPath($toolchainProbeRoot)
+        $toolchainProbePrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-profile-toolchain-'
+        if ($resolvedToolchainProbe.StartsWith($toolchainProbePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedToolchainProbe) { Remove-Item -LiteralPath $resolvedToolchainProbe -Recurse -Force }
+        } else { throw 'Profile toolchain probe cleanup boundary failed.' }
+    }
 
     $manifest = @(Get-RuntimeGateManifest)
     $ids = @($manifest | ForEach-Object id)
@@ -376,6 +794,8 @@ try {
         $WorkRoot = Join-Path $evidenceProbeRoot 'private-root'
         $Backend = 'cpu'
         $SourceCommit = '4f9676226f667d14608487df744f375db87127f8'
+        $RecipeCommit = '23845aa75667094b2a366b9fb98b6e7a7f4af592'
+        $ExecutionMode = 'local'
         $gateManifest = @(Get-RuntimeGateManifest)
         $gateObservations = [ordered]@{}
         $gateResultsPath = Join-Path $EvidenceRoot 'gate-results.json'
@@ -496,6 +916,44 @@ try {
     Add-CaseResult -Group downstream-parsers -Name 'cuda-version-json-green' -Passed $cudaVersionGreen.passed
     Add-CaseResult -Group downstream-parsers -Name 'cuda-version-json-red' -Passed (-not $cudaVersionRed.passed)
 
+    $CudaInstallerUrl = 'https://developer.download.nvidia.com/compute/cuda/12.8.0/network_installers/cuda_12.8.0_windows_network.exe'
+    $CudaInstallerSha256 = '89E7C44B526B6E30EC5089F221E918090D11F1D5B33C48FBFE08C6AC13F8A95C'
+    $CudaInstallerMd5 = '1D7E1CF4047F2B8D9A8096E18EBEA1C7'
+    $cudaProofRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-cuda-proof-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $cudaProofRoot | Out-Null
+        [IO.File]::WriteAllText((Join-Path $cudaProofRoot 'version.json'), '{"cuda":{"name":"CUDA SDK","version":"12.8.0"}}', [Text.UTF8Encoding]::new($false))
+        $cudaProofFiles = @()
+        foreach ($relative in @((Get-CudaComponentFileMap).Values | ForEach-Object { $_ } | ForEach-Object { $_ })) {
+            $path = Join-Path $cudaProofRoot $relative
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+            [IO.File]::WriteAllText($path, $relative, [Text.UTF8Encoding]::new($false))
+            $cudaProofFiles += [ordered]@{path=$relative.Replace('\','/');size=(Get-Item $path).Length;sha256=(Get-FileHash $path -Algorithm SHA256).Hash}
+        }
+        $cudaProofPath = Join-Path $cudaProofRoot 'proof.json'
+        $cudaProof = [ordered]@{
+            schema='diagnotes-local-cuda-install-proof-v1'; installer_url=$CudaInstallerUrl; installer_sha256=$CudaInstallerSha256; installer_md5=$CudaInstallerMd5
+            arguments=@('-s','-n','nvcc_12.8','cudart_12.8','cublas_12.8','cublas_dev_12.8','thrust_12.8')
+            components=@('nvcc_12.8','cudart_12.8','cublas_12.8','cublas_dev_12.8','thrust_12.8')
+            display_driver_requested=$false; driver_inventory_unchanged=$true; nvidia_service_task_state_unchanged=$true; lingering_installer_processes=@()
+            version_json_sha256=(Get-FileHash (Join-Path $cudaProofRoot 'version.json') -Algorithm SHA256).Hash; files=$cudaProofFiles
+        }
+        $cudaProof | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $cudaProofPath -Encoding utf8NoBOM
+        Add-CaseResult -Group cuda-reuse -Name consented-proof-green -Passed (Test-LocalCudaReuseProof -CudaRoot $cudaProofRoot -ProofPath $cudaProofPath).passed
+        Add-CaseResult -Group cuda-reuse -Name missing-proof-red -Passed (-not (Test-LocalCudaReuseProof -CudaRoot $cudaProofRoot -ProofPath (Join-Path $cudaProofRoot 'missing.json')).passed)
+        $displayProof = [ordered]@{}; foreach ($entry in $cudaProof.GetEnumerator()) { $displayProof[$entry.Key]=$entry.Value }; $displayProof.display_driver_requested = $true
+        $displayProof | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $cudaProofPath -Encoding utf8NoBOM
+        Add-CaseResult -Group cuda-reuse -Name display-driver-red -Passed (-not (Test-LocalCudaReuseProof -CudaRoot $cudaProofRoot -ProofPath $cudaProofPath).passed)
+        $cudaProof | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $cudaProofPath -Encoding utf8NoBOM
+        [IO.File]::AppendAllText((Join-Path $cudaProofRoot 'bin\nvcc.profile'), 'tamper')
+        Add-CaseResult -Group cuda-reuse -Name file-tamper-red -Passed (-not (Test-LocalCudaReuseProof -CudaRoot $cudaProofRoot -ProofPath $cudaProofPath).passed)
+    } finally {
+        $resolvedCudaProof = [IO.Path]::GetFullPath($cudaProofRoot)
+        $cudaProofPrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-cuda-proof-'
+        if ($resolvedCudaProof.StartsWith($cudaProofPrefix, [StringComparison]::OrdinalIgnoreCase)) { Remove-Item -LiteralPath $resolvedCudaProof -Recurse -Force }
+        else { throw 'CUDA proof cleanup boundary failed.' }
+    }
+
     $nvccLine = 'Cuda compilation tools, release 12.8, V12.8.93'
     foreach ($nvccFixture in @(
         [pscustomobject]@{name='nvcc-lf';text="header`n$nvccLine`n";expected=$true},
@@ -513,32 +971,137 @@ try {
     Add-CaseResult -Group downstream-parsers -Name 'signer-status-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status HashMismatch -Subject 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'))
     Add-CaseResult -Group downstream-parsers -Name 'redist-unsigned-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status NotSigned -Subject 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'))
     Add-CaseResult -Group downstream-parsers -Name 'redist-other-signer-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status Valid -Subject 'CN=Microsoft Windows, O=Contoso Corporation, C=US'))
+    $redistPathGreenEntries = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC/14.44.35112").entries
+    Add-CaseResult -Group redist-path -Name same-install-family-green -Passed (Resolve-MsvcRedistFromCacheContract -Entries $redistPathGreenEntries).passed
+    $redistOtherInstall = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/VS-A/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/VS-B/VC/Redist/MSVC/14.44.35112").entries
+    Add-CaseResult -Group redist-path -Name other-install-red -Passed (-not (Resolve-MsvcRedistFromCacheContract -Entries $redistOtherInstall).passed)
+    $redistOtherFamily = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/VS/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/VS/VC/Redist/MSVC/14.43.35112").entries
+    Add-CaseResult -Group redist-path -Name other-family-red -Passed (-not (Resolve-MsvcRedistFromCacheContract -Entries $redistOtherFamily).passed)
+    $redistCopiedTree = (ConvertFrom-CMakeCacheText -Text "CMAKE_CXX_COMPILER:FILEPATH=C:/VS/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe`nMSVC_REDIST_DIR:PATH=C:/VS/copied/14.44.35112").entries
+    Add-CaseResult -Group redist-path -Name copied-tree-red -Passed (-not (Resolve-MsvcRedistFromCacheContract -Entries $redistCopiedTree).passed)
     $redistHash = ('A' * 64)
     $microsoftSubject = 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'
-    Add-CaseResult -Group redist-closure -Name file-green -Passed (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 $redistHash -SignatureStatus Valid -SignerSubject $microsoftSubject).passed
-    Add-CaseResult -Group redist-closure -Name bytes-tampered-red -Passed (-not (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 ('B' * 64) -SignatureStatus Valid -SignerSubject $microsoftSubject).passed)
-    Add-CaseResult -Group redist-closure -Name unsigned-red -Passed (-not (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 $redistHash -SignatureStatus NotSigned -SignerSubject $microsoftSubject).passed)
-    Add-CaseResult -Group redist-closure -Name other-signer-red -Passed (-not (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 $redistHash -SignatureStatus Valid -SignerSubject 'CN=Contoso, O=Contoso Corporation, C=US').passed)
+    $redistFileGreen = @{ SourceSha256=$redistHash; BundleSha256=$redistHash; SourceSignatureStatus='Valid'; SourceSignerSubject=$microsoftSubject; BundleSignatureStatus='Valid'; BundleSignerSubject=$microsoftSubject }
+    Add-CaseResult -Group redist-closure -Name file-green -Passed (Test-MsvcRedistFileContract @redistFileGreen).passed
+    $redistTampered = @{} + $redistFileGreen; $redistTampered.BundleSha256 = ('B' * 64)
+    Add-CaseResult -Group redist-closure -Name bytes-tampered-red -Passed (-not (Test-MsvcRedistFileContract @redistTampered).passed)
+    $redistUnsigned = @{} + $redistFileGreen; $redistUnsigned.BundleSignatureStatus = 'NotSigned'
+    Add-CaseResult -Group redist-closure -Name unsigned-red -Passed (-not (Test-MsvcRedistFileContract @redistUnsigned).passed)
+    $redistOtherSigner = @{} + $redistFileGreen; $redistOtherSigner.BundleSignerSubject = 'CN=Contoso, O=Contoso Corporation, C=US'
+    Add-CaseResult -Group redist-closure -Name other-signer-red -Passed (-not (Test-MsvcRedistFileContract @redistOtherSigner).passed)
+    $redistMicrosoftSignerMismatch = @{} + $redistFileGreen; $redistMicrosoftSignerMismatch.BundleSignerSubject = 'CN=Microsoft Windows Publisher, O=Microsoft Corporation, C=US'
+    Add-CaseResult -Group redist-closure -Name microsoft-signer-mismatch-red -Passed (-not (Test-MsvcRedistFileContract @redistMicrosoftSignerMismatch).passed)
     Add-CaseResult -Group redist-closure -Name set-green -Passed (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll') -ImportedNames @('VCRUNTIME140.dll')).passed
     Add-CaseResult -Group redist-closure -Name orphan-red -Passed (-not (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll','msvcp140_atomic_wait.dll') -ImportedNames @('vcruntime140.dll')).passed)
     Add-CaseResult -Group redist-closure -Name missing-import-red -Passed (-not (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll') -ImportedNames @('vcruntime140.dll','msvcp140_atomic_wait.dll')).passed)
     Add-CaseResult -Group redist-closure -Name duplicate-red -Passed (-not (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll','VCRUNTIME140.dll') -ImportedNames @('vcruntime140.dll')).passed)
+    Add-CaseResult -Group redist-closure -Name vcomp-case-duplicate-red -Passed (-not (Test-MsvcRedistClosureContract -PresentNames @('vcomp140.dll','VCOMP140.DLL') -ImportedNames @('VCOMP140.DLL')).passed)
+    $redistMinimizeRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-redist-minimize-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $redistMinimizeBin = Join-Path $redistMinimizeRoot 'bin'
+        New-Item -ItemType Directory -Path $redistMinimizeBin | Out-Null
+        foreach ($name in @('msvcp140.dll','vcomp140.dll','nemo-speech.exe')) {
+            [IO.File]::WriteAllBytes((Join-Path $redistMinimizeBin $name), [byte[]](1))
+        }
+        [IO.File]::WriteAllBytes((Join-Path $redistMinimizeRoot 'vcruntime140.dll'), [byte[]](1))
+        $removedRedist = @(Remove-PreinstalledMsvcRedistributables -Root $redistMinimizeRoot)
+        Add-CaseResult -Group redist-closure -Name preinstalled-exact-set-removed -Passed ((@($removedRedist | Sort-Object) -join ',') -ceq 'msvcp140.dll,vcomp140.dll')
+        Add-CaseResult -Group redist-closure -Name non-redist-bin-preserved -Passed (Test-Path -LiteralPath (Join-Path $redistMinimizeBin 'nemo-speech.exe') -PathType Leaf)
+        Add-CaseResult -Group redist-closure -Name outside-bin-preserved -Passed (Test-Path -LiteralPath (Join-Path $redistMinimizeRoot 'vcruntime140.dll') -PathType Leaf)
+    } finally {
+        $resolvedRedistMinimize = [IO.Path]::GetFullPath($redistMinimizeRoot)
+        $redistMinimizePrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-redist-minimize-'
+        if ($resolvedRedistMinimize.StartsWith($redistMinimizePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedRedistMinimize) { Remove-Item -LiteralPath $resolvedRedistMinimize -Recurse -Force }
+        } else { throw 'Redist minimization probe cleanup boundary failed.' }
+    }
 
-    $dumpbinGreen = "preamble`r`n  Image has the following dependencies:`r`n`r`n    KERNEL32.dll`r`n    VCRUNTIME140.dll`r`n`r`n  Summary`r`n"
+    $dumpbinGreen = "preamble`r`n  Image has the following dependencies:`r`n`r`n    KERNEL32.dll`r`n    VCRUNTIME140.dll`r`n    VCOMP140.DLL`r`n`r`n  Summary`r`n"
     $dumpbinParsed = ConvertFrom-DumpbinDependentsText -Text $dumpbinGreen
     $dumpbinUnknown = ConvertFrom-DumpbinDependentsText -Text "  Image has the following dependencies:`n`n    KERNEL32.dll`n    not a dll line`n"
     $dumpbinDuplicate = ConvertFrom-DumpbinDependentsText -Text "  Image has the following dependencies:`n`n    KERNEL32.dll`n    KERNEL32.dll`n"
-    Add-CaseResult -Group downstream-parsers -Name 'dumpbin-green' -Passed ($dumpbinParsed.passed -and $dumpbinParsed.dependencies.Count -eq 2)
+    Add-CaseResult -Group downstream-parsers -Name 'dumpbin-green' -Passed ($dumpbinParsed.passed -and $dumpbinParsed.dependencies.Count -eq 3 -and $dumpbinParsed.dependencies[2] -ceq 'VCOMP140.DLL')
     Add-CaseResult -Group downstream-parsers -Name 'dumpbin-unknown-red' -Passed (-not $dumpbinUnknown.passed)
     Add-CaseResult -Group downstream-parsers -Name 'dumpbin-duplicate-red' -Passed (-not $dumpbinDuplicate.passed)
 
     Add-CaseResult -Group downstream-parsers -Name 'inventory-known-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/nemo-speech.exe').passed
     Add-CaseResult -Group downstream-parsers -Name 'inventory-asr-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/nemo_speech_asr.dll').passed
     Add-CaseResult -Group downstream-parsers -Name 'inventory-asr-c-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/nemo_speech_asr_c.dll').passed
-    Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-atomic-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/msvcp140_atomic_wait.dll').passed
-    Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-codecvt-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/msvcp140_codecvt_ids.dll').passed
+    Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-atomic-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/MSVCP140_ATOMIC_WAIT.DLL').passed
+    Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-codecvt-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/MsVcP140_CoDeCvT_iDs.DlL').passed
+    $redistClassificationExpected = [pscustomobject]@{ origin='Microsoft Visual C++ Redist from effective MSVC toolchain'; license='LicenseRef-Microsoft-Visual-Cpp-Runtime' }
+    foreach ($vcompPath in @('bin/vcomp140.dll','bin/VCOMP140.DLL','bin/VcOmP140.DlL')) {
+        $vcompClassification = Get-RuntimeFileClassification -RelativePath $vcompPath
+        Add-CaseResult -Group downstream-parsers -Name ('inventory-redist-vcomp-' + $vcompPath.Substring(4) + '-green') -Passed (
+            $vcompClassification.passed -and $vcompClassification.origin -ceq $redistClassificationExpected.origin -and
+            $vcompClassification.license -ceq $redistClassificationExpected.license
+        )
+    }
+    Add-CaseResult -Group redist-path -Name 'vcomp-openmp-source-green' -Passed ((Resolve-MsvcRedistSourcePath -Name 'VCOMP140.DLL' -RedistVersionRoot 'C:\VS\VC\Redist\MSVC\14.44.35112') -ceq 'C:\VS\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.OpenMP\vcomp140.dll')
+    $vcompNeighborRejected = $false
+    try { [void](Resolve-MsvcRedistSourcePath -Name 'vcomp141.dll' -RedistVersionRoot 'C:\VS\VC\Redist\MSVC\14.44.35112') } catch { $vcompNeighborRejected = $true }
+    Add-CaseResult -Group redist-path -Name 'vcomp-neighbor-red' -Passed $vcompNeighborRejected
     Add-CaseResult -Group downstream-parsers -Name 'inventory-unknown-red' -Passed (-not (Get-RuntimeFileClassification -RelativePath 'bin/unknown-tool.exe').passed)
     Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-similar-red' -Passed (-not (Get-RuntimeFileClassification -RelativePath 'bin/msvcp140_atomic_wait_extra.dll').passed)
+    foreach ($upstreamSharePath in @(
+        'share/doc/nemo-speech/README.md','share/doc/nemo-speech/CONTRIBUTING.md',
+        'share/doc/nemo-speech/docs/asr/configuration.md','share/nemo-speech/config/asr.example.yaml',
+        'share/nemo-speech/config/README.md','share/nemo-speech/model-index.json'
+    )) {
+        $upstreamShareClassification = Get-RuntimeFileClassification -RelativePath $upstreamSharePath
+        Add-CaseResult -Group downstream-parsers -Name ('inventory-upstream-share-' + [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($upstreamSharePath)) + '-green') -Passed (
+            $upstreamShareClassification.passed -and $upstreamShareClassification.origin -ceq 'NeMo-Speech.cpp distribution' -and
+            $upstreamShareClassification.license -ceq 'Apache-2.0'
+        )
+    }
+    foreach ($invalidUpstreamSharePath in @(
+        'share/doc/nemo-speech/payload.exe','share/doc/nemo-speech/docs/../LICENSE',
+        'share/nemo-speech/config/secret.yaml','share/nemo-speech/config/asr.example.yaml.bak',
+        'share/nemo-speech/model-index.json.bak'
+    )) {
+        Add-CaseResult -Group downstream-parsers -Name ('inventory-upstream-share-' + [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($invalidUpstreamSharePath)) + '-red') -Passed (
+            -not (Get-RuntimeFileClassification -RelativePath $invalidUpstreamSharePath).passed
+        )
+    }
+    foreach ($invalidVcompPath in @(
+        'BIN/VCOMP140.DLL','bin\VCOMP140.DLL','bin/sub/VCOMP140.DLL','bin//VCOMP140.DLL',
+        'C:/bin/VCOMP140.DLL','bin/../VCOMP140.DLL','bin/VCOMP140.DLL.bak','bin/VCOMP141.DLL',
+        'bin/VCOMP140_1.DLL','bin/VCOMP140d.DLL'
+    )) {
+        Add-CaseResult -Group downstream-parsers -Name ('inventory-vcomp-boundary-' + [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($invalidVcompPath)) + '-red') -Passed (
+            -not (Get-RuntimeFileClassification -RelativePath $invalidVcompPath).passed
+        )
+    }
+
+    $syntheticMsvcBanner = "Microsoft (R) C/C++ compiler version 19.44.35221 for x64`r`nCopyright (C) Microsoft Corporation."
+    $shortMsvcVersion = ConvertTo-ShortMsvcVersionString -Text $syntheticMsvcBanner -ExitCode 0 -ExpectedToolsetVersion '14.44.35207'
+    Add-CaseResult -Group msvc-version -Name synthetic-green -Passed ($shortMsvcVersion.GetType() -eq [string] -and $shortMsvcVersion -ceq '19.44.35221')
+    $serializedMsvc = ([ordered]@{ msvc=$shortMsvcVersion } | ConvertTo-Json -Compress)
+    Add-CaseResult -Group msvc-version -Name serialized-small-green -Passed (
+        $serializedMsvc -ceq '{"msvc":"19.44.35221"}' -and $serializedMsvc.Length -lt 64 -and
+        $serializedMsvc -notmatch 'ErrorRecord|InvocationInfo|Users\\|[`r`n]'
+    )
+    try { Get-Item -LiteralPath 'Z:\diagnotes-fixture-does-not-exist' -ErrorAction Stop } catch { $fixtureErrorRecord = $_ }
+    $invalidMsvcInputs = @(
+        [pscustomobject]@{ name='error-record-red'; value=[object]$fixtureErrorRecord; exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='invocation-info-red'; value=[object]$fixtureErrorRecord.InvocationInfo; exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='custom-object-red'; value=[object]([pscustomobject]@{ text=$syntheticMsvcBanner }); exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='array-red'; value=[object]@($syntheticMsvcBanner); exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='duplicate-version-red'; value=[object]($syntheticMsvcBanner + "`n19.44.35221"); exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='x86-red'; value=[object]'Microsoft compiler version 19.44.35221 for x86'; exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='minor-mismatch-red'; value=[object]'Microsoft compiler version 19.43.35221 for x64'; exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='nonzero-exit-red'; value=[object]$syntheticMsvcBanner; exit=2; toolset='14.44.35207' },
+        [pscustomobject]@{ name='empty-red'; value=[object]''; exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='oversized-red'; value=[object]($syntheticMsvcBanner + ('x' * 4096)); exit=0; toolset='14.44.35207' },
+        [pscustomobject]@{ name='private-path-red'; value=[object]($syntheticMsvcBanner + "`nC:\Users\fixture"); exit=0; toolset='14.44.35207' }
+    )
+    foreach ($invalidMsvcInput in $invalidMsvcInputs) {
+        $msvcRejected = $false
+        try {
+            [void](ConvertTo-ShortMsvcVersionString -Text $invalidMsvcInput.value -ExitCode $invalidMsvcInput.exit -ExpectedToolsetVersion $invalidMsvcInput.toolset)
+        } catch { $msvcRejected = $true }
+        Add-CaseResult -Group msvc-version -Name $invalidMsvcInput.name -Passed $msvcRejected
+    }
     $cpuProfileNames = @('nemo-speech.exe','nemo_speech_asr.dll','nemo_speech_asr_c.dll','ggml.dll','ggml-cpu.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll')
     $cudaProfileNames = @('nemo-speech.exe','nemo_speech_asr.dll','nemo_speech_asr_c.dll','ggml.dll','ggml-cuda.dll','cublas64_12.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll')
     Add-CaseResult -Group downstream-parsers -Name 'profile-cpu-green' -Passed (Test-RuntimeBinaryProfile -Names $cpuProfileNames -RequestedBackend cpu).passed
@@ -548,6 +1111,19 @@ try {
     Add-CaseResult -Group downstream-parsers -Name 'profile-unknown-red' -Passed (-not (Test-RuntimeBinaryProfile -Names @($cpuProfileNames + 'mystery.exe') -RequestedBackend cpu).passed)
     foreach ($cudaContaminant in @('ggml-cuda.dll','cublas64_12.dll','cublasLt64_12.dll','cudart64_12.dll')) {
         Add-CaseResult -Group cpu-profile -Name "$cudaContaminant-red" -Passed (-not (Test-RuntimeBinaryProfile -Names @($cpuProfileNames + $cudaContaminant) -RequestedBackend cpu).passed)
+    }
+    $physicalDbghelpRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-profile-dbghelp-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $physicalDbghelpRoot | Out-Null
+        foreach ($name in @($cpuProfileNames + 'dbghelp.dll')) { [IO.File]::WriteAllBytes((Join-Path $physicalDbghelpRoot $name), [byte[]](1)) }
+        $physicalNames = @(Get-ChildItem -LiteralPath $physicalDbghelpRoot -File | ForEach-Object Name)
+        Add-CaseResult -Group system-dll-boundary -Name physical-dbghelp-profile-red -Passed (-not (Test-RuntimeBinaryProfile -Names $physicalNames -RequestedBackend cpu).passed)
+    } finally {
+        $resolvedPhysicalDbghelp = [IO.Path]::GetFullPath($physicalDbghelpRoot)
+        $physicalDbghelpPrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-profile-dbghelp-'
+        if ($resolvedPhysicalDbghelp.StartsWith($physicalDbghelpPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $resolvedPhysicalDbghelp) { Remove-Item -LiteralPath $resolvedPhysicalDbghelp -Recurse -Force }
+        } else { throw 'Physical DbgHelp profile cleanup boundary failed.' }
     }
 
     $attestationHash = ('a' * 64)
@@ -569,6 +1145,15 @@ try {
         [ordered]@{name='candidate.zip';digest=[ordered]@{sha256=('b' * 64)}}
     ) } } }) | ConvertTo-Json -Depth 10
     Add-CaseResult -Group attestation -Name 'conflicting-subject-red' -Passed (-not (Test-AttestationVerificationDocument -Json $conflictAttestation -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).passed)
+
+    $candidateSelfTestOutput = (& pwsh -NoProfile -File $CandidateTestPath -SelfTest 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw 'Runtime candidate self-test process failed.' }
+    $candidateSelfTest = $candidateSelfTestOutput | ConvertFrom-Json -Depth 10
+    foreach ($candidateCase in @($candidateSelfTest.cases)) {
+        Add-CaseResult -Group candidate-acceptance -Name ([string]$candidateCase.name) -Passed ([bool]$candidateCase.passed)
+    }
+    Add-CaseResult -Group candidate-acceptance -Name 'self-test-summary-green' -Passed ([bool]$candidateSelfTest.passed)
+    $candidateSelfTestOutput = $null
 
     $workflowText = Get-Content -LiteralPath $WorkflowPath -Raw
     Add-CaseResult -Group workflow-static -Name 'no-release-primitives' -Passed ($workflowText -notmatch '(?im)\b(?:gh\s+release|softprops/action-gh-release|create-release|isDraft|prerelease)\b')

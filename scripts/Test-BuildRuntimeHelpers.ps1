@@ -45,6 +45,7 @@ try {
 
     $privateRootLower = $WorkRoot.ToLowerInvariant()
     $privateRootForward = $WorkRoot.Replace('\', '/')
+    $privateRootJsonEscaped = $WorkRoot.Replace('\', '\\')
     $cases = @(
         [ordered]@{
             name='absent'; fixture='absent'; content=$null
@@ -66,6 +67,16 @@ try {
                 ([regex]::Matches($actual, [regex]::Escape('<private-path>'))).Count -eq 3 -and
                     -not $actual.Contains($WorkRoot, [StringComparison]::OrdinalIgnoreCase) -and
                     -not $actual.Contains($privateRootForward, [StringComparison]::OrdinalIgnoreCase)
+            }
+        },
+        [ordered]@{
+            name='json_escaped_private_path'; fixture='text'
+            content=('{"directory":"' + $privateRootJsonEscaped + '\\build","command":"' + $privateRootJsonEscaped.ToUpperInvariant() + '\\tool.exe"}')
+            validate={
+                param($actual)
+                ([regex]::Matches($actual, [regex]::Escape('<private-path>'))).Count -eq 2 -and
+                    -not $actual.Contains($privateRootJsonEscaped, [StringComparison]::OrdinalIgnoreCase) -and
+                    -not $actual.Contains($WorkRoot, [StringComparison]::OrdinalIgnoreCase)
             }
         },
         [ordered]@{

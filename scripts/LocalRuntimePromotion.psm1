@@ -251,7 +251,9 @@ function Assert-NoPrivatePathText {
         [string[]]$AdditionalForbidden = @()
     )
 
-    $scan = Test-PathPrivacyContract -LiteralPaths @($Root) -PhysicalRoots @($AdditionalForbidden) `
+    $profileRoot = [Environment]::GetFolderPath('UserProfile')
+    $physicalRoots = @(@($AdditionalForbidden) + $profileRoot | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $scan = Test-PathPrivacyContract -LiteralPaths @($Root) -PhysicalRoots $physicalRoots `
         -LeafPhysicalRoots @() -UserProfile ([Environment]::GetFolderPath('UserProfile')) `
         -UserName ([Environment]::UserName) -RelativeTo $Root
     if (-not $scan.passed) {

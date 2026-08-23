@@ -7,7 +7,7 @@ function Get-LocalRuntimePromotionContract {
     param()
 
     $checkout = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-    $targetCommit = (& git -C $checkout rev-parse HEAD).Trim()
+    $targetCommit = (@(& git -C $checkout rev-parse HEAD) -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or $targetCommit -cnotmatch '^[0-9a-f]{40}$') {
         throw 'Could not resolve the exact local promotion target commit.'
     }

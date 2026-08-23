@@ -134,6 +134,7 @@ try {
     Invoke-Positive 'exact seven-asset set' { Assert-ExactAssetSet @($contract.AssetNames) $contract.AssetNames }
     Invoke-Negative 'preexisting draft' { Assert-EmptyReleaseSurface @([pscustomobject]@{ draft = $true }) '' }
     Invoke-Negative 'preexisting tag' { Assert-EmptyReleaseSurface @() 'abc refs/tags/existing' }
+    Invoke-Positive 'empty release and tag surface' { Assert-EmptyReleaseSurface @() '' }
     Invoke-Negative 'clobber argument' { Assert-NoClobberArgument @('upload', '--clobber') }
     Invoke-Positive 'empty explicit extra arguments' { Assert-NoClobberArgument @() }
 

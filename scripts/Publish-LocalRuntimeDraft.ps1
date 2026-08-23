@@ -43,23 +43,23 @@ try {
     }
     Assert-AssetSnapshot -AssetRoot $assets -Snapshot $snapshot | Out-Null
 
-    $remote = (& git remote get-url origin).Trim()
+    $remote = (@(& git remote get-url origin) -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or $remote -notmatch '(?i)(?:github\.com[:/])dnl0037/diagnotes-nemotron-runtime(?:\.git)?$') {
         throw "Unexpected Git origin: '$remote'."
     }
-    $remoteTarget = (& git ls-remote origin 'refs/heads/main').Trim()
+    $remoteTarget = (@(& git ls-remote origin 'refs/heads/main') -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or ($remoteTarget -split '\s+')[0] -cne $contract.TargetCommit) {
         throw 'GitHub main is not the exact frozen target commit.'
     }
 
-    $account = (& gh api user --jq .login).Trim()
+    $account = (@(& gh api user --jq .login) -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or $account -cne $contract.Account) {
         throw "Unexpected authenticated GitHub account: '$account'."
     }
     $releaseOutput = & gh api "repos/$($contract.Repository)/releases?per_page=100"
     if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate GitHub releases.' }
     $existingReleases = @($releaseOutput | ConvertFrom-Json -Depth 64)
-    $remoteTags = (& git ls-remote --tags origin).Trim()
+    $remoteTags = (@(& git ls-remote --tags origin) -join "`n").Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate remote tags.' }
     Assert-EmptyReleaseSurface -Releases $existingReleases -RemoteTags $remoteTags | Out-Null
     Assert-AssetSnapshot -AssetRoot $assets -Snapshot $snapshot | Out-Null
@@ -116,7 +116,7 @@ This release is a private draft pending independent fiscalization. It is not con
     $finalRelease = $finalOutput | ConvertFrom-Json -Depth 64
     Assert-DraftReleaseContract -Release $finalRelease -ExpectedTag $contract.Tag -ExpectedTarget $contract.TargetCommit | Out-Null
     Assert-ExactAssetSet -ActualNames @($finalRelease.assets | ForEach-Object name) -ExpectedNames $contract.AssetNames | Out-Null
-    $postDraftTags = (& git ls-remote --tags origin).Trim()
+    $postDraftTags = (@(& git ls-remote --tags origin) -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($postDraftTags)) {
         throw 'A public Git tag unexpectedly exists while the release is a draft.'
     }

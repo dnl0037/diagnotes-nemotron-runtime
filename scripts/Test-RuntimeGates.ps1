@@ -25,19 +25,32 @@ function Test-AttestationVerificationDocument {
     if ($documents.Count -eq 0 -or ($documents.Count -eq 1 -and $documents[0].Count -eq 0)) {
         return [pscustomobject]@{ passed=$false; created=$false; reason='no verified attestations'; matches=0 }
     }
-    $matches = @()
+    $expectedSubjects = @()
+    $validStatements = 0
+    $malformed = $false
     foreach ($document in $documents) {
         if ($null -eq $document -or $null -eq $document.PSObject.Properties['verificationResult'] -or
-            $null -eq $document.verificationResult.PSObject.Properties['statement']) { continue }
-        if ([string]$document.verificationResult.statement.predicateType -cne 'https://slsa.dev/provenance/v1') { continue }
-        foreach ($subject in @($document.verificationResult.statement.subject)) {
-            if ([string]$subject.name -ceq $ExpectedName -and
-                [string]$subject.digest.sha256 -ceq $ExpectedSha256.ToLowerInvariant()) {
-                $matches += $subject
-            }
+            $null -eq $document.verificationResult.PSObject.Properties['statement']) { $malformed = $true; continue }
+        $statement = $document.verificationResult.statement
+        if ([string]$statement.predicateType -cne 'https://slsa.dev/provenance/v1' -or $null -eq $statement.PSObject.Properties['subject']) { $malformed = $true; continue }
+        $subjects = @($statement.subject)
+        if ($subjects.Count -eq 0) { $malformed = $true; continue }
+        $statementValid = $true
+        foreach ($subject in $subjects) {
+            if ($null -eq $subject -or $null -eq $subject.PSObject.Properties['name'] -or $null -eq $subject.PSObject.Properties['digest'] -or
+                $null -eq $subject.digest.PSObject.Properties['sha256'] -or [string]$subject.name -eq '' -or
+                [string]$subject.digest.sha256 -notmatch '^(?i:[0-9a-f]{64})$') { $statementValid = $false; break }
+        }
+        if (-not $statementValid) { $malformed = $true; continue }
+        $validStatements++
+        foreach ($subject in $subjects) {
+            if ([string]$subject.name -ceq $ExpectedName) { $expectedSubjects += $subject }
         }
     }
-    return [pscustomobject]@{ passed=$matches.Count -ge 1; created=$true; reason=if ($matches.Count -ge 1) { 'subject digest verified' } else { 'subject digest mismatch' }; matches=$matches.Count }
+    $created = $validStatements -gt 0 -and -not $malformed
+    $passed = $created -and $expectedSubjects.Count -eq 1 -and [string]$expectedSubjects[0].digest.sha256 -ceq $ExpectedSha256.ToLowerInvariant()
+    $reason = if (-not $created) { 'no structurally valid SLSA verification document' } elseif ($expectedSubjects.Count -ne 1) { 'expected subject cardinality mismatch' } elseif (-not $passed) { 'subject digest mismatch' } else { 'subject digest verified exactly once' }
+    return [pscustomobject]@{ passed=$passed; created=$created; reason=$reason; matches=$expectedSubjects.Count }
 }
 
 if ($Mode -eq 'FinalizeAttestation') {
@@ -106,9 +119,16 @@ try {
         'Test-CudaVersionJson',
         'Test-NvccVersionText',
         'Test-MicrosoftSignerIdentity',
+        'Test-MsvcRedistFileContract',
+        'Test-IsAllowedMsvcRedistributableName',
         'ConvertFrom-DumpbinDependentsText',
         'Get-RuntimeFileClassification',
         'Test-RuntimeBinaryProfile',
+        'Test-CanonicalRuntimeRelativePath',
+        'Get-RuntimeTreeRecords',
+        'ConvertTo-CanonicalRuntimeRecordMap',
+        'Test-PayloadMetadataClosure',
+        'Test-MsvcRedistClosureContract',
         'ConvertFrom-WindowsCommandLine',
         'Test-CompileCommandsContract',
         'Get-RuntimeGateManifest',
@@ -189,6 +209,10 @@ try {
         static_crt = $baseCacheLines -replace 'MultiThreadedDLL', 'MultiThreaded'
         debug_crt = $baseCacheLines -replace 'MultiThreadedDLL', 'MultiThreadedDebugDLL'
         export_off = $baseCacheLines -replace 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON', 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=OFF'
+        export_uninitialized = $baseCacheLines -replace 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON', 'CMAKE_EXPORT_COMPILE_COMMANDS:UNINITIALIZED=ON'
+        export_wrong_type = $baseCacheLines -replace 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON', 'CMAKE_EXPORT_COMPILE_COMMANDS:STRING=ON'
+        export_missing = @($baseCacheLines | Where-Object { $_ -cne 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' })
+        export_duplicate = $baseCacheLines + 'CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON'
         malformed = $baseCacheLines -replace '^CMAKE_TOOLCHAIN_FILE:', 'CMAKE_TOOLCHAIN_FILE :'
         bare_cr = @($baseCacheLines[0..4] + ("$($baseCacheLines[5])`r$($baseCacheLines[6])") + $baseCacheLines[7..($baseCacheLines.Count - 1)])
     }
@@ -200,11 +224,29 @@ try {
     $compileFixtures = @(
         [pscustomobject]@{ name='cl-command'; expected=$true; inspectable=$true; json='[{"directory":"C:/b","command":"\"C:\\VS\\cl.exe\" /nologo /MD /c \"C:\\src\\one.cpp\"","file":"C:/src/one.cpp"}]' },
         [pscustomobject]@{ name='cl-arguments'; expected=$true; inspectable=$true; json='[{"arguments":["C:/VS/cl.exe","/MD","/c","one.cpp"],"file":"one.cpp"}]' },
+        [pscustomobject]@{ name='cl-dash-tokens'; expected=$true; inspectable=$true; json='[{"arguments":["cl.exe","-MD","-c","one.cpp"]}]' },
         [pscustomobject]@{ name='nvcc-equals'; expected=$true; inspectable=$true; json='[{"arguments":["C:/CUDA/nvcc.exe","-Xcompiler=/MD","-c","one.cu"],"file":"one.cu"}]' },
         [pscustomobject]@{ name='nvcc-pair'; expected=$true; inspectable=$true; json='[{"arguments":["nvcc.exe","--compiler-options","/MD","-c","one.cu"],"file":"one.cu"}]' },
-        [pscustomobject]@{ name='mt'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MT","/c","one.cpp"]}]' },
-        [pscustomobject]@{ name='mtd'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MTd","/c","one.cpp"]}]' },
-        [pscustomobject]@{ name='mdd'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MDd","/c","one.cpp"]}]' },
+        [pscustomobject]@{ name='nvcc-dash-md'; expected=$true; inspectable=$true; json='[{"arguments":["nvcc.exe","-Xcompiler=-MD","-c","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-own-md-no-forwarding'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-c","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-own-md-with-forwarding'; expected=$true; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-Xcompiler=/MD","-c","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-duplicate'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-Xcompiler=/MD","--compiler-options=-MD","-c","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-incomplete'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-Xcompiler","-c","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-response'; expected=$false; inspectable=$false; json='[{"arguments":["nvcc.exe","-Xcompiler=@host.rsp","-c","one.cu"]}]' },
+        [pscustomobject]@{ name='mt-slash'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MT","/c","one.cpp"]}]' },
+        [pscustomobject]@{ name='mt-dash'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","-MT","-c","one.cpp"]}]' },
+        [pscustomobject]@{ name='mtd-slash'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MTd","/c","one.cpp"]}]' },
+        [pscustomobject]@{ name='mtd-dash'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","-MTd","-c","one.cpp"]}]' },
+        [pscustomobject]@{ name='mdd-slash'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MDd","/c","one.cpp"]}]' },
+        [pscustomobject]@{ name='mdd-dash'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","-MDd","-c","one.cpp"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-mt-slash'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-c","-Xcompiler=/MT","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-mt-dash'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-c","-Xcompiler=-MT","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-mtd-slash'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-c","--compiler-options","/MTd","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-mtd-dash'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-c","--compiler-options","-MTd","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-mdd-slash'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-c","-Xcompiler=/MDd","one.cu"]}]' },
+        [pscustomobject]@{ name='nvcc-forward-mdd-dash'; expected=$false; inspectable=$true; json='[{"arguments":["nvcc.exe","-MD","-c","-Xcompiler=-MDd","one.cu"]}]' },
+        [pscustomobject]@{ name='md-substring'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MD-similar","/c","one.cpp"]}]' },
+        [pscustomobject]@{ name='compile-substring'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/MD","/compile","one.cpp"]}]' },
         [pscustomobject]@{ name='missing-md'; expected=$false; inspectable=$true; json='[{"arguments":["cl.exe","/c","one.cpp"]}]' },
         [pscustomobject]@{ name='invalid-json'; expected=$false; inspectable=$false; json='[' },
         [pscustomobject]@{ name='zero'; expected=$false; inspectable=$false; json='[]' },
@@ -282,14 +324,14 @@ try {
         '-DNEMO_SPEECH_WITH_GRPC=OFF','-DNEMO_SPEECH_BUILD_TESTS=OFF','-DBUILD_TESTING=OFF',
         '-DNEMO_SPEECH_BUILD_EXAMPLES=OFF','-DNEMO_SPEECH_BUILD_TOOLS=OFF'
     )
-    $expectedCpuProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=OFF','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_GGML_PATCHED=OFF'))
-    $expectedCudaProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=ON','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_CUBLAS_SHIM=ON','-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89'))
+    $expectedCpuProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=OFF','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_GGML_PATCHED=OFF'))
+    $expectedCudaProfile = @($baselineProfile[0..3] + '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON' + $baselineProfile[4..($baselineProfile.Count - 1)] + @('-DGGML_CUDA=ON','-DGGML_VULKAN=OFF','-DNEMO_SPEECH_CUBLAS_SHIM=ON','-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89'))
     Add-CaseResult -Group semantic-diff -Name 'cpu-baseline-plus-export-only' -Passed (($cpuProfile | ConvertTo-Json -Compress) -ceq ($expectedCpuProfile | ConvertTo-Json -Compress))
     Add-CaseResult -Group semantic-diff -Name 'cuda-baseline-plus-export-only' -Passed (($cudaProfile | ConvertTo-Json -Compress) -ceq ($expectedCudaProfile | ConvertTo-Json -Compress))
 
     $manifest = @(Get-RuntimeGateManifest)
     $ids = @($manifest | ForEach-Object id)
-    Add-CaseResult -Group dag -Name 'stable-unique-ids' -Passed (($ids.Count -eq 18) -and (@($ids | Sort-Object -Unique).Count -eq 18))
+    Add-CaseResult -Group dag -Name 'stable-unique-ids' -Passed (($ids.Count -eq 19) -and (@($ids | Sort-Object -Unique).Count -eq 19))
     $allPass = [ordered]@{}
     foreach ($id in $ids) { $allPass[$id] = [pscustomobject]@{ status='PASS'; reason='fixture green' } }
     $greenResults = @(Invoke-RuntimeGateGraph -Manifest $manifest -Observations $allPass)
@@ -365,7 +407,64 @@ try {
         }
     }
 
-    foreach ($gateId in @('source-patch','cache','compile-arguments-inspectable','crt','profile','legal','pe-closure','inventory','sbom','zip-extraction','defender-tree','defender-zip','privacy','attestation-created','attestation-digest-verified')) {
+    $payloadBytes = [Text.UTF8Encoding]::new($false).GetBytes('payload')
+    $payloadHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadBytes))
+    $payloadRecords = @([pscustomobject]@{ path='bin/payload.bin'; size=$payloadBytes.Length; sha256=$payloadHash })
+    $inventoryFixture = [ordered]@{ schema='diagnotes-runtime-inventory-v2'; scope='payload-only'; exclusions=@('inventory.json','sbom.spdx.json'); files=@([ordered]@{ path='bin/payload.bin'; size=$payloadBytes.Length; sha256=$payloadHash; kind='data'; origin='fixture'; license='Apache-2.0' }) }
+    $sbomFixture = [ordered]@{ spdxVersion='SPDX-2.3'; dataLicense='CC0-1.0'; files=@([ordered]@{ fileName='bin/payload.bin'; checksums=@([ordered]@{algorithm='SHA256';checksumValue=$payloadHash}) }) }
+    $inventoryJsonFixture = $inventoryFixture | ConvertTo-Json -Depth 8 -Compress
+    $sbomJsonFixture = $sbomFixture | ConvertTo-Json -Depth 8 -Compress
+    $utf8Fixture = [Text.UTF8Encoding]::new($false)
+    $inventoryFixtureBytes = $utf8Fixture.GetBytes($inventoryJsonFixture)
+    $sbomFixtureBytes = $utf8Fixture.GetBytes($sbomJsonFixture)
+    $inventoryFixtureHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($inventoryFixtureBytes))
+    $sbomFixtureHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($sbomFixtureBytes))
+    $metadataFixture = [ordered]@{ schema='diagnotes-payload-metadata-evidence-v1'; files=@(
+        [ordered]@{name='inventory.json';size=$inventoryFixtureBytes.Length;sha256=$inventoryFixtureHash},
+        [ordered]@{name='sbom.spdx.json';size=$sbomFixtureBytes.Length;sha256=$sbomFixtureHash}
+    ) }
+    $metadataJsonFixture = $metadataFixture | ConvertTo-Json -Depth 6 -Compress
+    $actualRecords = @($payloadRecords + @(
+        [pscustomobject]@{path='inventory.json';size=$inventoryFixtureBytes.Length;sha256=$inventoryFixtureHash},
+        [pscustomobject]@{path='sbom.spdx.json';size=$sbomFixtureBytes.Length;sha256=$sbomFixtureHash}
+    ))
+    Add-CaseResult -Group payload-closure -Name green -Passed (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $actualRecords -InventoryJson $inventoryJsonFixture -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed
+    Add-CaseResult -Group payload-closure -Name extra-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords @($actualRecords + [pscustomobject]@{path='extra.bin';size=1;sha256=('A'*64)}) -InventoryJson $inventoryJsonFixture -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed)
+    Add-CaseResult -Group payload-closure -Name missing-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords @($actualRecords | Where-Object path -ne 'bin/payload.bin') -InventoryJson $inventoryJsonFixture -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed)
+    Add-CaseResult -Group payload-closure -Name tamper-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords @($actualRecords | ForEach-Object { if ($_.path -eq 'bin/payload.bin') { [pscustomobject]@{path=$_.path;size=$_.size;sha256=('B'*64)} } else { $_ } }) -InventoryJson $inventoryJsonFixture -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed)
+    Add-CaseResult -Group payload-closure -Name case-collision-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords @($actualRecords + [pscustomobject]@{path='BIN/PAYLOAD.BIN';size=$payloadBytes.Length;sha256=$payloadHash}) -InventoryJson $inventoryJsonFixture -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed)
+    $traversalInventory = $inventoryFixture | ConvertTo-Json -Depth 8 -Compress
+    $traversalInventory = $traversalInventory.Replace('bin/payload.bin','../payload.bin')
+    Add-CaseResult -Group payload-closure -Name traversal-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $actualRecords -InventoryJson $traversalInventory -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed)
+    $separatorInventory = $inventoryFixtureJson = $inventoryJsonFixture.Replace('bin/payload.bin','bin\\payload.bin')
+    Add-CaseResult -Group payload-closure -Name separator-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $actualRecords -InventoryJson $separatorInventory -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed)
+    $divergentSbom = $sbomJsonFixture.Replace($payloadHash, ('C'*64))
+    Add-CaseResult -Group payload-closure -Name sbom-divergent-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $actualRecords -InventoryJson $inventoryJsonFixture -SbomJson $divergentSbom -MetadataEvidenceJson $metadataJsonFixture).passed)
+    $divergentMetadata = $metadataJsonFixture.Replace($inventoryFixtureHash, ('D'*64))
+    Add-CaseResult -Group payload-closure -Name metadata-divergent-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $actualRecords -InventoryJson $inventoryJsonFixture -SbomJson $sbomJsonFixture -MetadataEvidenceJson $divergentMetadata).passed)
+    Add-CaseResult -Group payload-closure -Name malformed-inventory-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $actualRecords -InventoryJson '{' -SbomJson $sbomJsonFixture -MetadataEvidenceJson $metadataJsonFixture).passed)
+    $payloadProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('diagnotes-payload-closure-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $payloadProbeRoot | Out-Null
+        [IO.File]::WriteAllText((Join-Path $payloadProbeRoot 'payload.bin'), 'payload', [Text.UTF8Encoding]::new($false))
+        $physicalPayload = @(Get-RuntimeTreeRecords -Root $payloadProbeRoot)
+        $physicalInventoryJson = [ordered]@{ schema='diagnotes-runtime-inventory-v2'; scope='payload-only'; exclusions=@('inventory.json','sbom.spdx.json'); files=$physicalPayload } | ConvertTo-Json -Depth 8 -Compress
+        $physicalSbomJson = [ordered]@{ spdxVersion='SPDX-2.3'; dataLicense='CC0-1.0'; files=@($physicalPayload | ForEach-Object { [ordered]@{fileName=$_.path;checksums=@([ordered]@{algorithm='SHA256';checksumValue=$_.sha256})} }) } | ConvertTo-Json -Depth 8 -Compress
+        [IO.File]::WriteAllText((Join-Path $payloadProbeRoot 'inventory.json'), $physicalInventoryJson, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $payloadProbeRoot 'sbom.spdx.json'), $physicalSbomJson, [Text.UTF8Encoding]::new($false))
+        $physicalMetadata = [ordered]@{ schema='diagnotes-payload-metadata-evidence-v1'; files=@('inventory.json','sbom.spdx.json' | ForEach-Object { $item=Get-Item -LiteralPath (Join-Path $payloadProbeRoot $_); [ordered]@{name=$_;size=$item.Length;sha256=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash} }) } | ConvertTo-Json -Depth 6 -Compress
+        $physicalActual = @(Get-RuntimeTreeRecords -Root $payloadProbeRoot)
+        Add-CaseResult -Group payload-closure -Name physical-tree-green -Passed (Test-PayloadMetadataClosure -PayloadRecords $physicalPayload -ActualRecords $physicalActual -InventoryJson $physicalInventoryJson -SbomJson $physicalSbomJson -MetadataEvidenceJson $physicalMetadata).passed
+        [IO.File]::WriteAllText((Join-Path $payloadProbeRoot 'extra.bin'), 'extra', [Text.UTF8Encoding]::new($false))
+        Add-CaseResult -Group payload-closure -Name physical-extra-red -Passed (-not (Test-PayloadMetadataClosure -PayloadRecords $physicalPayload -ActualRecords @(Get-RuntimeTreeRecords -Root $payloadProbeRoot) -InventoryJson $physicalInventoryJson -SbomJson $physicalSbomJson -MetadataEvidenceJson $physicalMetadata).passed)
+    } finally {
+        $resolvedPayloadProbe = [IO.Path]::GetFullPath($payloadProbeRoot)
+        $payloadProbePrefix = Join-Path ([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) 'diagnotes-payload-closure-'
+        if ($resolvedPayloadProbe.StartsWith($payloadProbePrefix, [StringComparison]::OrdinalIgnoreCase)) { Remove-Item -LiteralPath $resolvedPayloadProbe -Recurse -Force }
+        else { throw 'Payload probe path boundary failed.' }
+    }
+
+    foreach ($gateId in @('source-patch','cache','compile-arguments-inspectable','crt','profile','legal','pe-closure','inventory','sbom','payload-closure','zip-extraction','defender-tree','defender-zip','privacy','attestation-created','attestation-digest-verified')) {
         $mutated = [ordered]@{}
         foreach ($entry in $allPass.GetEnumerator()) { $mutated[$entry.Key] = $entry.Value }
         $mutated[$gateId] = [pscustomobject]@{ status='FAIL'; reason="mutated $gateId" }
@@ -412,6 +511,18 @@ try {
     Add-CaseResult -Group downstream-parsers -Name 'signer-microsoft-green' -Passed (Test-MicrosoftSignerIdentity -Status Valid -Subject 'CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US')
     Add-CaseResult -Group downstream-parsers -Name 'signer-substring-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status Valid -Subject 'CN=Microsoft Evil, O=Contoso Corporation, C=US'))
     Add-CaseResult -Group downstream-parsers -Name 'signer-status-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status HashMismatch -Subject 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'))
+    Add-CaseResult -Group downstream-parsers -Name 'redist-unsigned-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status NotSigned -Subject 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'))
+    Add-CaseResult -Group downstream-parsers -Name 'redist-other-signer-red' -Passed (-not (Test-MicrosoftSignerIdentity -Status Valid -Subject 'CN=Microsoft Windows, O=Contoso Corporation, C=US'))
+    $redistHash = ('A' * 64)
+    $microsoftSubject = 'CN=Microsoft Windows, O=Microsoft Corporation, C=US'
+    Add-CaseResult -Group redist-closure -Name file-green -Passed (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 $redistHash -SignatureStatus Valid -SignerSubject $microsoftSubject).passed
+    Add-CaseResult -Group redist-closure -Name bytes-tampered-red -Passed (-not (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 ('B' * 64) -SignatureStatus Valid -SignerSubject $microsoftSubject).passed)
+    Add-CaseResult -Group redist-closure -Name unsigned-red -Passed (-not (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 $redistHash -SignatureStatus NotSigned -SignerSubject $microsoftSubject).passed)
+    Add-CaseResult -Group redist-closure -Name other-signer-red -Passed (-not (Test-MsvcRedistFileContract -SourceSha256 $redistHash -BundleSha256 $redistHash -SignatureStatus Valid -SignerSubject 'CN=Contoso, O=Contoso Corporation, C=US').passed)
+    Add-CaseResult -Group redist-closure -Name set-green -Passed (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll') -ImportedNames @('VCRUNTIME140.dll')).passed
+    Add-CaseResult -Group redist-closure -Name orphan-red -Passed (-not (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll','msvcp140_atomic_wait.dll') -ImportedNames @('vcruntime140.dll')).passed)
+    Add-CaseResult -Group redist-closure -Name missing-import-red -Passed (-not (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll') -ImportedNames @('vcruntime140.dll','msvcp140_atomic_wait.dll')).passed)
+    Add-CaseResult -Group redist-closure -Name duplicate-red -Passed (-not (Test-MsvcRedistClosureContract -PresentNames @('vcruntime140.dll','VCRUNTIME140.dll') -ImportedNames @('vcruntime140.dll')).passed)
 
     $dumpbinGreen = "preamble`r`n  Image has the following dependencies:`r`n`r`n    KERNEL32.dll`r`n    VCRUNTIME140.dll`r`n`r`n  Summary`r`n"
     $dumpbinParsed = ConvertFrom-DumpbinDependentsText -Text $dumpbinGreen
@@ -422,16 +533,42 @@ try {
     Add-CaseResult -Group downstream-parsers -Name 'dumpbin-duplicate-red' -Passed (-not $dumpbinDuplicate.passed)
 
     Add-CaseResult -Group downstream-parsers -Name 'inventory-known-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/nemo-speech.exe').passed
+    Add-CaseResult -Group downstream-parsers -Name 'inventory-asr-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/nemo_speech_asr.dll').passed
+    Add-CaseResult -Group downstream-parsers -Name 'inventory-asr-c-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/nemo_speech_asr_c.dll').passed
+    Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-atomic-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/msvcp140_atomic_wait.dll').passed
+    Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-codecvt-green' -Passed (Get-RuntimeFileClassification -RelativePath 'bin/msvcp140_codecvt_ids.dll').passed
     Add-CaseResult -Group downstream-parsers -Name 'inventory-unknown-red' -Passed (-not (Get-RuntimeFileClassification -RelativePath 'bin/unknown-tool.exe').passed)
-    Add-CaseResult -Group downstream-parsers -Name 'profile-cpu-green' -Passed (Test-RuntimeBinaryProfile -Names @('nemo-speech.exe','ggml.dll','ggml-cpu.dll') -RequestedBackend cpu).passed
-    Add-CaseResult -Group downstream-parsers -Name 'profile-cuda-green' -Passed (Test-RuntimeBinaryProfile -Names @('nemo-speech.exe','ggml.dll','ggml-cuda.dll','cublas64_12.dll') -RequestedBackend cuda).passed
-    Add-CaseResult -Group downstream-parsers -Name 'profile-unknown-red' -Passed (-not (Test-RuntimeBinaryProfile -Names @('nemo-speech.exe','mystery.exe') -RequestedBackend cpu).passed)
+    Add-CaseResult -Group downstream-parsers -Name 'inventory-redist-similar-red' -Passed (-not (Get-RuntimeFileClassification -RelativePath 'bin/msvcp140_atomic_wait_extra.dll').passed)
+    $cpuProfileNames = @('nemo-speech.exe','nemo_speech_asr.dll','nemo_speech_asr_c.dll','ggml.dll','ggml-cpu.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll')
+    $cudaProfileNames = @('nemo-speech.exe','nemo_speech_asr.dll','nemo_speech_asr_c.dll','ggml.dll','ggml-cuda.dll','cublas64_12.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll')
+    Add-CaseResult -Group downstream-parsers -Name 'profile-cpu-green' -Passed (Test-RuntimeBinaryProfile -Names $cpuProfileNames -RequestedBackend cpu).passed
+    Add-CaseResult -Group downstream-parsers -Name 'profile-cuda-green' -Passed (Test-RuntimeBinaryProfile -Names $cudaProfileNames -RequestedBackend cuda).passed
+    Add-CaseResult -Group downstream-parsers -Name 'profile-asr-missing-red' -Passed (-not (Test-RuntimeBinaryProfile -Names @($cpuProfileNames | Where-Object { $_ -cne 'nemo_speech_asr.dll' }) -RequestedBackend cpu).passed)
+    Add-CaseResult -Group downstream-parsers -Name 'profile-asr-c-missing-red' -Passed (-not (Test-RuntimeBinaryProfile -Names @($cpuProfileNames | Where-Object { $_ -cne 'nemo_speech_asr_c.dll' }) -RequestedBackend cpu).passed)
+    Add-CaseResult -Group downstream-parsers -Name 'profile-unknown-red' -Passed (-not (Test-RuntimeBinaryProfile -Names @($cpuProfileNames + 'mystery.exe') -RequestedBackend cpu).passed)
+    foreach ($cudaContaminant in @('ggml-cuda.dll','cublas64_12.dll','cublasLt64_12.dll','cudart64_12.dll')) {
+        Add-CaseResult -Group cpu-profile -Name "$cudaContaminant-red" -Passed (-not (Test-RuntimeBinaryProfile -Names @($cpuProfileNames + $cudaContaminant) -RequestedBackend cpu).passed)
+    }
 
     $attestationHash = ('a' * 64)
     $attestationJson = @([ordered]@{ verificationResult=[ordered]@{ statement=[ordered]@{ predicateType='https://slsa.dev/provenance/v1'; subject=@([ordered]@{name='candidate.zip';digest=[ordered]@{sha256=$attestationHash}}) } } }) | ConvertTo-Json -Depth 10
     Add-CaseResult -Group attestation -Name 'subject-digest-green' -Passed (Test-AttestationVerificationDocument -Json $attestationJson -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).passed
     Add-CaseResult -Group attestation -Name 'digest-mutation-red' -Passed (-not (Test-AttestationVerificationDocument -Json $attestationJson -ExpectedName candidate.zip -ExpectedSha256 ('b' * 64)).passed)
     Add-CaseResult -Group attestation -Name 'absence-red' -Passed (-not (Test-AttestationVerificationDocument -Json '[]' -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).passed)
+    Add-CaseResult -Group attestation -Name 'invalid-json-red' -Passed (-not (Test-AttestationVerificationDocument -Json '[' -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).passed)
+    Add-CaseResult -Group attestation -Name 'statement-absent-red' -Passed (-not (Test-AttestationVerificationDocument -Json '[{"verificationResult":{}}]' -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).created)
+    Add-CaseResult -Group attestation -Name 'predicate-wrong-red' -Passed (-not (Test-AttestationVerificationDocument -Json ('[{"verificationResult":{"statement":{"predicateType":"other","subject":[{"name":"candidate.zip","digest":{"sha256":"' + $attestationHash + '"}}]}}}]') -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).created)
+    Add-CaseResult -Group attestation -Name 'subject-malformed-red' -Passed (-not (Test-AttestationVerificationDocument -Json '[{"verificationResult":{"statement":{"predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"candidate.zip","digest":{}}]}}}]' -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).created)
+    $duplicateAttestation = @([ordered]@{ verificationResult=[ordered]@{ statement=[ordered]@{ predicateType='https://slsa.dev/provenance/v1'; subject=@(
+        [ordered]@{name='candidate.zip';digest=[ordered]@{sha256=$attestationHash}},
+        [ordered]@{name='candidate.zip';digest=[ordered]@{sha256=$attestationHash}}
+    ) } } }) | ConvertTo-Json -Depth 10
+    Add-CaseResult -Group attestation -Name 'duplicate-subject-red' -Passed (-not (Test-AttestationVerificationDocument -Json $duplicateAttestation -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).passed)
+    $conflictAttestation = @([ordered]@{ verificationResult=[ordered]@{ statement=[ordered]@{ predicateType='https://slsa.dev/provenance/v1'; subject=@(
+        [ordered]@{name='candidate.zip';digest=[ordered]@{sha256=$attestationHash}},
+        [ordered]@{name='candidate.zip';digest=[ordered]@{sha256=('b' * 64)}}
+    ) } } }) | ConvertTo-Json -Depth 10
+    Add-CaseResult -Group attestation -Name 'conflicting-subject-red' -Passed (-not (Test-AttestationVerificationDocument -Json $conflictAttestation -ExpectedName candidate.zip -ExpectedSha256 $attestationHash).passed)
 
     $workflowText = Get-Content -LiteralPath $WorkflowPath -Raw
     Add-CaseResult -Group workflow-static -Name 'no-release-primitives' -Passed ($workflowText -notmatch '(?im)\b(?:gh\s+release|softprops/action-gh-release|create-release|isDraft|prerelease)\b')

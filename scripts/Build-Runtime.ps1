@@ -124,7 +124,7 @@ function New-ProfileArguments {
     )
     $arguments = @(
         '-S', $RequestedSourceRoot, '-B', $RequestedBuildRoot,
-        '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+        '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON',
         '-DNEMO_SPEECH_BUILD_ASR=ON',
         '-DNEMO_SPEECH_BUILD_HTTP=ON',
         '-DNEMO_SPEECH_BUILD_CLI=ON',
@@ -322,6 +322,25 @@ function Test-MicrosoftSignerIdentity {
     return $fields.Contains('O') -and $fields['O'] -ceq 'Microsoft Corporation'
 }
 
+function Test-MsvcRedistFileContract {
+    param(
+        [Parameter(Mandatory)][string]$SourceSha256,
+        [Parameter(Mandatory)][string]$BundleSha256,
+        [Parameter(Mandatory)][string]$SignatureStatus,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SignerSubject
+    )
+    $errors = @()
+    if ($SourceSha256 -notmatch '^(?i:[0-9a-f]{64})$' -or $BundleSha256 -notmatch '^(?i:[0-9a-f]{64})$' -or $SourceSha256 -cne $BundleSha256) { $errors += 'Redist bytes differ from effective toolset' }
+    if (-not (Test-MicrosoftSignerIdentity -Status $SignatureStatus -Subject $SignerSubject)) { $errors += 'Redist signer identity' }
+    return [pscustomobject]@{ passed=$errors.Count -eq 0; errors=@($errors) }
+}
+
+function Test-IsAllowedMsvcRedistributableName {
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name -match '^(?i:(?:msvcp|vcruntime|concrt|vccorlib)140(?:_[0-9A-Za-z]+)?\.dll)$') { return $true }
+    return @('msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll') -ccontains $Name
+}
+
 function ConvertFrom-DumpbinDependentsText {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
     $lines = [regex]::Split($Text, "`r`n|`n", [Text.RegularExpressions.RegexOptions]::None)
@@ -359,11 +378,19 @@ function ConvertFrom-DumpbinDependentsText {
 function Get-RuntimeFileClassification {
     param([Parameter(Mandatory)][string]$RelativePath)
     $path = $RelativePath.Replace('\','/')
+    $redistMatch = [regex]::Match($path, '^bin/(?<name>[^/]+\.dll)$')
+    if ($redistMatch.Success -and (Test-IsAllowedMsvcRedistributableName -Name $redistMatch.Groups['name'].Value)) {
+        return [pscustomobject]@{
+            passed=$true
+            origin='Microsoft Visual C++ Redist from effective MSVC toolchain'
+            license='LicenseRef-Microsoft-Visual-Cpp-Runtime'
+        }
+    }
     $rules = @(
-        [pscustomobject]@{ pattern='^bin/(?i:(?:msvcp|vcruntime|concrt|vccorlib)140(?:_[0-9A-Za-z]+)?\.dll)$'; origin='Microsoft Visual C++ Redist from effective MSVC toolchain'; license='LicenseRef-Microsoft-Visual-Cpp-Runtime' },
         [pscustomobject]@{ pattern='^bin/ggml(?:-[A-Za-z0-9_-]+)?\.dll$'; origin='ggml'; license='MIT' },
         [pscustomobject]@{ pattern='^bin/(?:cublas|cublasLt|cudart)64_12\.dll$'; origin='NeMo-Speech.cpp CUDA shim + CUDA runtime'; license='Apache-2.0 AND LicenseRef-NVIDIA-CUDA-Toolkit' },
         [pscustomobject]@{ pattern='^bin/nemo-speech\.exe$'; origin='NeMo-Speech.cpp distribution'; license='Apache-2.0' },
+        [pscustomobject]@{ pattern='^bin/nemo_speech_asr(?:_c)?\.dll$'; origin='NeMo-Speech.cpp distribution'; license='Apache-2.0' },
         [pscustomobject]@{ pattern='^(?:LICENSE|NOTICE|realtime-language-v1\.patch|runtime-build\.json|inventory\.json|sbom\.spdx\.json|msvc-redist-inventory\.json|pe-imports\.json)$'; origin='DiagNotes runtime recipe'; license='Apache-2.0' },
         [pscustomobject]@{ pattern='^share/licenses/microsoft-visual-cpp-runtime/(?:Visual-Studio-2022-Community-License-EN\.docx|Visual-Studio-2022-Redistribution\.html|Redist\.txt)$'; origin='Microsoft official license/REDIST evidence'; license='LicenseRef-Microsoft-Visual-Studio-2022' },
         [pscustomobject]@{ pattern='^share/licenses/nvidia-cuda-toolkit/EULA\.txt$'; origin='NVIDIA CUDA Toolkit'; license='LicenseRef-NVIDIA-CUDA-Toolkit' },
@@ -383,13 +410,148 @@ function Test-RuntimeBinaryProfile {
     )
     $errors = @()
     if ($Names -notcontains 'nemo-speech.exe') { $errors += 'nemo-speech.exe missing' }
+    if ($Names -notcontains 'nemo_speech_asr.dll') { $errors += 'nemo_speech_asr.dll missing' }
+    if ($Names -notcontains 'nemo_speech_asr_c.dll') { $errors += 'nemo_speech_asr_c.dll missing' }
     if ($RequestedBackend -eq 'cuda' -and $Names -notcontains 'ggml-cuda.dll') { $errors += 'ggml-cuda.dll missing' }
-    if ($RequestedBackend -eq 'cpu' -and $Names -contains 'ggml-cuda.dll') { $errors += 'CPU contains ggml-cuda.dll' }
+    if ($RequestedBackend -eq 'cpu') {
+        foreach ($name in $Names) {
+            if ($name -match '^(?i:ggml-cuda(?:-[A-Za-z0-9_-]+)?\.dll|cublas64_[0-9]+\.dll|cublasLt64_[0-9]+\.dll|cudart64_[0-9]+\.dll)$') {
+                $errors += "CPU contains CUDA binary $name"
+            }
+        }
+    }
     if ($Names -contains 'nvcuda.dll') { $errors += 'host driver redistributed' }
     foreach ($name in $Names) {
         $classification = Get-RuntimeFileClassification -RelativePath "bin/$name"
         if (-not $classification.passed) { $errors += "unclassified binary $name" }
     }
+    return [pscustomobject]@{ passed=$errors.Count -eq 0; errors=@($errors) }
+}
+
+function Test-CanonicalRuntimeRelativePath {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [IO.Path]::IsPathRooted($Path) -or $Path.Contains('\')) { return $false }
+    if ($Path.StartsWith('/', [StringComparison]::Ordinal) -or $Path.EndsWith('/', [StringComparison]::Ordinal) -or $Path.Contains('//')) { return $false }
+    foreach ($segment in @($Path.Split('/'))) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -ceq '.' -or $segment -ceq '..' -or $segment.Contains(':')) { return $false }
+    }
+    return $true
+}
+
+function Get-RuntimeTreeRecords {
+    param([Parameter(Mandatory)][string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw 'Runtime tree root is missing.' }
+    $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $records = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse | Sort-Object FullName)) {
+        $relative = [IO.Path]::GetRelativePath($resolvedRoot, $file.FullName).Replace('\','/')
+        if (-not (Test-CanonicalRuntimeRelativePath -Path $relative)) { throw 'Runtime tree contains a non-canonical path.' }
+        if (-not $seen.Add($relative)) { throw 'Runtime tree contains a case-insensitive path collision.' }
+        $records += [pscustomobject]@{ path=$relative; size=[int64]$file.Length; sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash }
+    }
+    return @($records)
+}
+
+function ConvertTo-CanonicalRuntimeRecordMap {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
+    $map = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $errors = @()
+    foreach ($record in @($Records)) {
+        $pathProperty = $record.PSObject.Properties['path']
+        $sizeProperty = $record.PSObject.Properties['size']
+        $hashProperty = $record.PSObject.Properties['sha256']
+        if ($null -eq $pathProperty -or $null -eq $sizeProperty -or $null -eq $hashProperty) { $errors += 'record fields'; continue }
+        $path = [string]$pathProperty.Value
+        $hash = [string]$hashProperty.Value
+        $size = [int64]$sizeProperty.Value
+        if (-not (Test-CanonicalRuntimeRelativePath -Path $path) -or $size -lt 0 -or $hash -notmatch '^(?i:[0-9a-f]{64})$') { $errors += "invalid record $path"; continue }
+        if ($map.ContainsKey($path)) { $errors += "duplicate record $path"; continue }
+        $map.Add($path, [pscustomobject]@{ path=$path; size=$size; sha256=$hash.ToUpperInvariant() })
+    }
+    return [pscustomobject]@{ passed=$errors.Count -eq 0; map=$map; errors=@($errors) }
+}
+
+function Test-PayloadMetadataClosure {
+    param(
+        [Parameter(Mandatory)][object[]]$PayloadRecords,
+        [Parameter(Mandatory)][object[]]$ActualRecords,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$InventoryJson,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SbomJson,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$MetadataEvidenceJson
+    )
+    $errors = @()
+    try { $inventoryDocument = $InventoryJson | ConvertFrom-Json -Depth 30 -ErrorAction Stop }
+    catch { return [pscustomobject]@{ passed=$false; errors=@('invalid inventory JSON') } }
+    try { $sbomDocument = $SbomJson | ConvertFrom-Json -Depth 30 -ErrorAction Stop }
+    catch { return [pscustomobject]@{ passed=$false; errors=@('invalid SBOM JSON') } }
+    try { $metadataDocument = $MetadataEvidenceJson | ConvertFrom-Json -Depth 30 -ErrorAction Stop }
+    catch { return [pscustomobject]@{ passed=$false; errors=@('invalid metadata evidence JSON') } }
+
+    if ([string]$inventoryDocument.schema -cne 'diagnotes-runtime-inventory-v2' -or [string]$inventoryDocument.scope -cne 'payload-only') { $errors += 'inventory schema or scope' }
+    $exclusions = @($inventoryDocument.exclusions | ForEach-Object { [string]$_ })
+    if ($exclusions.Count -ne 2 -or $exclusions[0] -cne 'inventory.json' -or $exclusions[1] -cne 'sbom.spdx.json') { $errors += 'inventory exclusions' }
+    $payloadMapResult = ConvertTo-CanonicalRuntimeRecordMap -Records $PayloadRecords
+    $inventoryMapResult = ConvertTo-CanonicalRuntimeRecordMap -Records @($inventoryDocument.files)
+    $actualMapResult = ConvertTo-CanonicalRuntimeRecordMap -Records $ActualRecords
+    if (-not $payloadMapResult.passed) { $errors += $payloadMapResult.errors }
+    if (-not $inventoryMapResult.passed) { $errors += $inventoryMapResult.errors }
+    if (-not $actualMapResult.passed) { $errors += $actualMapResult.errors }
+
+    $sbomRecords = @()
+    if ([string]$sbomDocument.spdxVersion -cne 'SPDX-2.3' -or [string]$sbomDocument.dataLicense -cne 'CC0-1.0') { $errors += 'SBOM schema' }
+    foreach ($entry in @($sbomDocument.files)) {
+        $checksums = @($entry.checksums)
+        if ($checksums.Count -ne 1 -or [string]$checksums[0].algorithm -cne 'SHA256') { $errors += 'SBOM checksum shape'; continue }
+        $sbomRecords += [pscustomobject]@{ path=[string]$entry.fileName; size=if ($inventoryMapResult.map.ContainsKey([string]$entry.fileName)) { $inventoryMapResult.map[[string]$entry.fileName].size } else { 0 }; sha256=[string]$checksums[0].checksumValue }
+    }
+    $sbomMapResult = ConvertTo-CanonicalRuntimeRecordMap -Records $sbomRecords
+    if (-not $sbomMapResult.passed) { $errors += $sbomMapResult.errors }
+
+    foreach ($left in @($payloadMapResult.map, $inventoryMapResult.map, $sbomMapResult.map)) {
+        if ($left.Count -ne $payloadMapResult.map.Count) { $errors += 'payload cardinality'; continue }
+        foreach ($path in $payloadMapResult.map.Keys) {
+            if (-not $left.ContainsKey($path) -or $left[$path].size -ne $payloadMapResult.map[$path].size -or $left[$path].sha256 -cne $payloadMapResult.map[$path].sha256) { $errors += "payload divergence $path" }
+        }
+    }
+
+    $metadataRecords = @($metadataDocument.files | ForEach-Object { [pscustomobject]@{ path=[string]$_.name; size=[int64]$_.size; sha256=[string]$_.sha256 } })
+    $metadataMapResult = ConvertTo-CanonicalRuntimeRecordMap -Records $metadataRecords
+    if ([string]$metadataDocument.schema -cne 'diagnotes-payload-metadata-evidence-v1' -or -not $metadataMapResult.passed -or
+        $metadataMapResult.map.Count -ne 2 -or -not $metadataMapResult.map.ContainsKey('inventory.json') -or -not $metadataMapResult.map.ContainsKey('sbom.spdx.json')) { $errors += 'metadata evidence shape' }
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $serializedMetadata = [ordered]@{
+        'inventory.json'=$utf8.GetBytes($InventoryJson)
+        'sbom.spdx.json'=$utf8.GetBytes($SbomJson)
+    }
+    foreach ($entry in $serializedMetadata.GetEnumerator()) {
+        $serializedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($entry.Value))
+        if (-not $metadataMapResult.map.ContainsKey($entry.Key) -or $metadataMapResult.map[$entry.Key].size -ne $entry.Value.Length -or
+            $metadataMapResult.map[$entry.Key].sha256 -cne $serializedHash) { $errors += "serialized metadata divergence $($entry.Key)" }
+    }
+
+    $expectedFinal = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $payloadMapResult.map.Keys) { [void]$expectedFinal.Add($path) }
+    [void]$expectedFinal.Add('inventory.json'); [void]$expectedFinal.Add('sbom.spdx.json')
+    if ($actualMapResult.map.Count -ne $expectedFinal.Count) { $errors += 'final tree cardinality' }
+    foreach ($path in $expectedFinal) {
+        if (-not $actualMapResult.map.ContainsKey($path)) { $errors += "final tree missing $path"; continue }
+        $expected = if ($payloadMapResult.map.ContainsKey($path)) { $payloadMapResult.map[$path] } elseif ($metadataMapResult.map.ContainsKey($path)) { $metadataMapResult.map[$path] } else { $null }
+        if ($null -eq $expected -or $actualMapResult.map[$path].size -ne $expected.size -or $actualMapResult.map[$path].sha256 -cne $expected.sha256) { $errors += "final tree divergence $path" }
+    }
+    return [pscustomobject]@{ passed=$errors.Count -eq 0; errors=@($errors) }
+}
+
+function Test-MsvcRedistClosureContract {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PresentNames, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ImportedNames)
+    $present = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $imported = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $errors = @()
+    foreach ($name in $PresentNames) { if (-not (Test-IsAllowedMsvcRedistributableName -Name $name) -or -not $present.Add($name)) { $errors += 'invalid or duplicate present Redist' } }
+    foreach ($name in $ImportedNames) { if (-not (Test-IsAllowedMsvcRedistributableName -Name $name) -or -not $imported.Add($name)) { $errors += 'invalid or duplicate imported Redist' } }
+    if ($present.Count -ne $imported.Count) { $errors += 'Redist set cardinality mismatch' }
+    foreach ($name in $present) { if (-not $imported.Contains($name)) { $errors += "orphan Redist $name" } }
+    foreach ($name in $imported) { if (-not $present.Contains($name)) { $errors += "missing imported Redist $name" } }
     return [pscustomobject]@{ passed=$errors.Count -eq 0; errors=@($errors) }
 }
 
@@ -489,8 +651,8 @@ function Test-CompileCommandsContract {
             continue
         }
         $isNvcc = $compiler -in @('nvcc','nvcc.exe')
-        $compileToken = if ($isNvcc) { '-c' } else { '/c' }
-        if ($arguments -cnotcontains $compileToken) {
+        $hasCompileAction = @($arguments | Where-Object { $_ -ceq '/c' -or $_ -ceq '-c' }).Count -gt 0
+        if (-not $hasCompileAction) {
             $errors += "entry $index lacks compile action"
             continue
         }
@@ -505,11 +667,17 @@ function Test-CompileCommandsContract {
                 @($Matches[1] -split ',') | ForEach-Object { $forwarded.Add($_) }
             }
         }
-        $crtArguments = if ($isNvcc) { @($arguments + $forwarded.ToArray()) } else { $arguments }
-        $forbidden = @($crtArguments | Where-Object { $_ -in @('/MT','/MTd','/MDd') })
-        $hasMd = $crtArguments -contains '/MD'
+        if (@($forwarded | Where-Object { $_ -match '^@' }).Count -gt 0) {
+            $errors += "entry $index uses opaque forwarded response arguments"
+            $opaque = $true
+        }
+        $crtArguments = if ($isNvcc) { @($forwarded.ToArray()) } else { $arguments }
+        $forbidden = @($crtArguments | Where-Object { $_ -cin @('/MT','-MT','/MTd','-MTd','/MDd','-MDd') })
+        $mdTokens = @($crtArguments | Where-Object { $_ -ceq '/MD' -or $_ -ceq '-MD' })
+        $hasMd = $mdTokens.Count -eq 1
         if ($forbidden.Count -gt 0) { $errors += "entry $index contains forbidden CRT flag" }
-        if (-not $hasMd) { $errors += "entry $index lacks /MD" }
+        if ($mdTokens.Count -eq 0) { $errors += "entry $index lacks /MD" }
+        elseif ($mdTokens.Count -ne 1) { $errors += "entry $index has ambiguous CRT forwarding" }
         $summaries += [pscustomobject]@{ index=$index; compiler=$compiler; argument_count=$arguments.Count; has_md=$hasMd; forbidden_count=$forbidden.Count }
     }
     return [pscustomobject]@{
@@ -533,7 +701,8 @@ function Get-RuntimeGateManifest {
         [pscustomobject]@{ id='pe-closure'; dependencies=@('cache','legal') },
         [pscustomobject]@{ id='inventory'; dependencies=@('profile','legal','pe-closure') },
         [pscustomobject]@{ id='sbom'; dependencies=@('inventory') },
-        [pscustomobject]@{ id='zip-extraction'; dependencies=@('inventory','sbom') },
+        [pscustomobject]@{ id='payload-closure'; dependencies=@('inventory','sbom') },
+        [pscustomobject]@{ id='zip-extraction'; dependencies=@('payload-closure') },
         [pscustomobject]@{ id='defender-tree'; dependencies=@('zip-extraction') },
         [pscustomobject]@{ id='defender-zip'; dependencies=@('zip-extraction') },
         [pscustomobject]@{ id='privacy'; dependencies=@() },
@@ -1108,8 +1277,6 @@ $systemDlls = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordin
     'SETUPAPI.dll','SHELL32.dll','SHLWAPI.dll','USER32.dll','USERENV.dll','UCRTBASE.dll','VERSION.dll','WINHTTP.dll',
     'WINMM.dll','WS2_32.dll','WTSAPI32.dll'
 ) | ForEach-Object { [void]$systemDlls.Add($_) }
-$msvcPattern = '^(?i:(?:msvcp|vcruntime|concrt|vccorlib)140(?:_[0-9A-Za-z]+)?\.dll)$'
-
 function Get-PeDependencies {
     param([Parameter(Mandatory)][string]$Path)
     $output = (& $dumpbinPath /DEPENDENTS $Path 2>&1 | Out-String)
@@ -1141,7 +1308,7 @@ function Resolve-PeClosure {
             $key = $dependency.ToLowerInvariant()
             $classification = $null
             $resolved = $null
-            if ($dependency -match $msvcPattern) {
+            if (Test-IsAllowedMsvcRedistributableName -Name $dependency) {
                 if ($dependency -match '(?i)d\.dll$') { throw 'Debug MSVC runtime import is not redistributable.' }
                 $source = Join-Path $redistRoot $dependency
                 if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'Required MSVC DLL is absent from Redist.' }
@@ -1152,16 +1319,15 @@ function Resolve-PeClosure {
                     Copy-Item -LiteralPath $source -Destination $resolved
                     $files[$key] = $resolved
                 }
-                if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash) {
-                    throw 'App-local MSVC DLL differs from Redist bytes.'
-                }
                 $signature = Get-AuthenticodeSignature -LiteralPath $resolved
-                if ($null -eq $signature.SignerCertificate -or -not (Test-MicrosoftSignerIdentity -Status ([string]$signature.Status) -Subject $signature.SignerCertificate.Subject)) {
-                    throw 'App-local MSVC DLL signer identity is invalid.'
-                }
+                $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+                $resolvedHash = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash
+                $fileContract = Test-MsvcRedistFileContract -SourceSha256 $sourceHash -BundleSha256 $resolvedHash `
+                    -SignatureStatus ([string]$signature.Status) -SignerSubject $(if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Subject })
+                if (-not $fileContract.passed) { throw ('App-local MSVC DLL contract failed: ' + ($fileContract.errors -join '; ')) }
                 if ($recordedMsvc.Add($dependency)) {
                     $copied += [ordered]@{
-                        name=$dependency; size=(Get-Item -LiteralPath $resolved).Length; sha256=(Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash
+                        name=$dependency; size=(Get-Item -LiteralPath $resolved).Length; sha256=$resolvedHash
                         file_version=(Get-Item -LiteralPath $resolved).VersionInfo.FileVersion; product_version=(Get-Item -LiteralPath $resolved).VersionInfo.ProductVersion
                         architecture='x64'; origin="VC/Redist/MSVC/$redistVersion/x64/Microsoft.VC143.CRT/$dependency"
                         license='LicenseRef-Microsoft-Visual-Cpp-Runtime'; signer=$signature.SignerCertificate.Subject
@@ -1177,6 +1343,9 @@ function Resolve-PeClosure {
             if ($resolved) { $queue.Enqueue($resolved) }
         }
     }
+    $presentMsvc = @($files.Values | ForEach-Object { [IO.Path]::GetFileName($_) } | Where-Object { Test-IsAllowedMsvcRedistributableName -Name $_ })
+    $redistClosure = Test-MsvcRedistClosureContract -PresentNames $presentMsvc -ImportedNames @($recordedMsvc)
+    if (-not $redistClosure.passed) { throw ('MSVC Redist closure failed: ' + ($redistClosure.errors -join '; ')) }
     return [ordered]@{ edges=$edges; copied_msvc=$copied; pe_count=$seen.Count }
 }
 
@@ -1198,6 +1367,10 @@ if ($bundleStaged -and (Test-GateObservationPassed cache) -and (Test-GateObserva
 }
 
 $inventory = @()
+$payloadRecords = @()
+$inventoryJson = $null
+$sbomJson = $null
+$metadataEvidenceJson = $null
 $toolchain = $null
 if ((Test-GateObservationPassed profile) -and (Test-GateObservationPassed legal) -and (Test-GateObservationPassed pe-closure)) {
     try {
@@ -1215,20 +1388,20 @@ if ((Test-GateObservationPassed profile) -and (Test-GateObservationPassed legal)
         }
         $toolchain | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $BundleRoot 'runtime-build.json') -Encoding utf8NoBOM
         $toolchain | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'toolchain.json') -Encoding utf8NoBOM
-        Get-ChildItem -LiteralPath $BundleRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
-            $relative = [IO.Path]::GetRelativePath($BundleRoot, $_.FullName).Replace('\','/')
-            $classification = Get-RuntimeFileClassification -RelativePath $relative
-            if (-not $classification.passed) { throw "Inventory path is unclassified: $relative" }
+        $payloadRecords = @(Get-RuntimeTreeRecords -Root $BundleRoot)
+        foreach ($record in $payloadRecords) {
+            $classification = Get-RuntimeFileClassification -RelativePath $record.path
+            if (-not $classification.passed) { throw "Inventory path is unclassified: $($record.path)" }
             $inventory += [ordered]@{
-                path=$relative; size=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
-                kind=if ($_.Extension -in '.exe','.dll') { 'PE' } else { 'data' }; origin=$classification.origin; license=$classification.license
+                path=$record.path; size=$record.size; sha256=$record.sha256
+                kind=if ([IO.Path]::GetExtension($record.path) -in '.exe','.dll') { 'PE' } else { 'data' }; origin=$classification.origin; license=$classification.license
             }
         }
-        [ordered]@{ schema='diagnotes-runtime-inventory-v1'; files=$inventory } | ConvertTo-Json -Depth 8 |
-            Set-Content -LiteralPath (Join-Path $BundleRoot 'inventory.json') -Encoding utf8NoBOM
+        $inventoryJson = [ordered]@{ schema='diagnotes-runtime-inventory-v2'; scope='payload-only'; exclusions=@('inventory.json','sbom.spdx.json'); files=$inventory } | ConvertTo-Json -Depth 8
+        [IO.File]::WriteAllText((Join-Path $BundleRoot 'inventory.json'), $inventoryJson, [Text.UTF8Encoding]::new($false))
         [ordered]@{ schema='diagnotes-inventory-evidence-v1'; file_count=$inventory.Count; unknown_count=0 } | ConvertTo-Json -Depth 5 |
             Set-Content -LiteralPath (Join-Path $EvidenceRoot 'inventory.json') -Encoding utf8NoBOM
-        Set-GateObservation inventory PASS 'every payload file has exactly one explicit origin/license rule'
+        Set-GateObservation inventory PASS 'payload-only inventory serializes every operational file with exact exclusions'
     } catch { Set-GateObservation inventory FAIL $_.Exception.Message }
 }
 
@@ -1237,12 +1410,13 @@ if (Test-GateObservationPassed inventory) {
         $spdxFiles = @($inventory | ForEach-Object {
             [ordered]@{ fileName=$_.path; checksums=@([ordered]@{algorithm='SHA256';checksumValue=$_.sha256}); licenseConcluded=$_.license; licenseInfoInFiles=@($_.license) }
         })
-        [ordered]@{
+        $sbomJson = [ordered]@{
             spdxVersion='SPDX-2.3'; dataLicense='CC0-1.0'; SPDXID='SPDXRef-DOCUMENT'; name="$zipStem-sbom"
             documentNamespace="https://github.com/dnl0037/diagnotes-nemotron-runtime/sbom/$zipStem/$env:GITHUB_RUN_ID"
             creationInfo=[ordered]@{ created=(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); creators=@('Tool: Build-Runtime.ps1') }
             files=$spdxFiles
-        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $BundleRoot 'sbom.spdx.json') -Encoding utf8NoBOM
+        } | ConvertTo-Json -Depth 10
+        [IO.File]::WriteAllText((Join-Path $BundleRoot 'sbom.spdx.json'), $sbomJson, [Text.UTF8Encoding]::new($false))
         [ordered]@{ schema='diagnotes-sbom-evidence-v1'; files=$spdxFiles.Count; inventory_files=$inventory.Count } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'sbom.json') -Encoding utf8NoBOM
         if ($spdxFiles.Count -ne $inventory.Count) { throw 'SBOM/inventory cardinality mismatch.' }
@@ -1250,29 +1424,47 @@ if (Test-GateObservationPassed inventory) {
     } catch { Set-GateObservation sbom FAIL $_.Exception.Message }
 }
 
+if ((Test-GateObservationPassed inventory) -and (Test-GateObservationPassed sbom)) {
+    try {
+        $metadataFiles = @('inventory.json','sbom.spdx.json') | ForEach-Object {
+            $path = Join-Path $BundleRoot $_
+            [ordered]@{ name=$_; size=(Get-Item -LiteralPath $path).Length; sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+        }
+        $metadataEvidenceJson = [ordered]@{ schema='diagnotes-payload-metadata-evidence-v1'; files=@($metadataFiles) } | ConvertTo-Json -Depth 6
+        [IO.File]::WriteAllText((Join-Path $EvidenceRoot 'payload-metadata.json'), $metadataEvidenceJson, [Text.UTF8Encoding]::new($false))
+        $treeRecords = @(Get-RuntimeTreeRecords -Root $BundleRoot)
+        $payloadClosure = Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $treeRecords `
+            -InventoryJson $inventoryJson -SbomJson $sbomJson -MetadataEvidenceJson $metadataEvidenceJson
+        if (-not $payloadClosure.passed) { throw ('Payload closure failed: ' + ($payloadClosure.errors -join '; ')) }
+        Set-GateObservation payload-closure PASS 'serialized inventory, SBOM, detached metadata and exact final tree are bijective'
+    } catch { Set-GateObservation payload-closure FAIL $_.Exception.Message }
+}
+
 $zipPath = Join-Path $ArtifactsRoot "$zipStem.zip"
 $recheckRoot = $null
 $extractedClosure = $null
-if ((Test-GateObservationPassed inventory) -and (Test-GateObservationPassed sbom)) {
+if (Test-GateObservationPassed payload-closure) {
     try {
+        $preCompressionRecords = @(Get-RuntimeTreeRecords -Root $BundleRoot)
+        $preCompressionClosure = Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $preCompressionRecords `
+            -InventoryJson $inventoryJson -SbomJson $sbomJson -MetadataEvidenceJson $metadataEvidenceJson
+        if (-not $preCompressionClosure.passed) { throw ('Pre-compression payload closure failed: ' + ($preCompressionClosure.errors -join '; ')) }
         Compress-Archive -LiteralPath $BundleRoot -DestinationPath $zipPath -CompressionLevel Optimal
         $extracted = Join-Path $WorkRoot 'zip-recheck'
         Expand-Archive -LiteralPath $zipPath -DestinationPath $extracted
         $recheckRoot = Join-Path $extracted $zipStem
         if (-not (Test-Path -LiteralPath (Join-Path $recheckRoot 'bin\nemo-speech.exe') -PathType Leaf)) { throw 'Clean ZIP extraction lacks nemo-speech.exe.' }
+        $extractedRecords = @(Get-RuntimeTreeRecords -Root $recheckRoot)
+        $extractedPayloadClosure = Test-PayloadMetadataClosure -PayloadRecords $payloadRecords -ActualRecords $extractedRecords `
+            -InventoryJson ([IO.File]::ReadAllText((Join-Path $recheckRoot 'inventory.json'))) `
+            -SbomJson ([IO.File]::ReadAllText((Join-Path $recheckRoot 'sbom.spdx.json'))) -MetadataEvidenceJson $metadataEvidenceJson
+        if (-not $extractedPayloadClosure.passed) { throw ('Extracted payload closure failed: ' + ($extractedPayloadClosure.errors -join '; ')) }
         $extractedClosure = Resolve-PeClosure -Root $recheckRoot -AllowMsvcCopy $false
-        foreach ($entry in $inventory) {
-            $extractedPath = Join-Path $recheckRoot $entry.path.Replace('/', '\')
-            if (-not (Test-Path -LiteralPath $extractedPath -PathType Leaf)) { throw "Clean ZIP extraction is missing $($entry.path)." }
-            if ((Get-Item -LiteralPath $extractedPath).Length -ne $entry.size -or (Get-FileHash -LiteralPath $extractedPath -Algorithm SHA256).Hash -cne $entry.sha256) {
-                throw "Clean ZIP extraction differs at $($entry.path)."
-            }
-        }
         [ordered]@{
             schema='diagnotes-zip-recheck-v1'; name=(Split-Path -Leaf $zipPath); size=(Get-Item -LiteralPath $zipPath).Length
             sha256=(Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; inventoried_files=$inventory.Count; pe_import_edges=$extractedClosure.edges.Count
         } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'zip-recheck.json') -Encoding utf8NoBOM
-        Set-GateObservation zip-extraction PASS 'final ZIP name/hash and clean extraction match inventory'
+        Set-GateObservation zip-extraction PASS 'final ZIP and clean extraction preserve exact payload plus two detached-covered metadata files'
     } catch { Set-GateObservation zip-extraction FAIL $_.Exception.Message }
 }
 
@@ -1329,7 +1521,7 @@ try {
 
 $internalPrerequisites = @(
     'source-patch','cache','vcpkg','compile-arguments-inspectable','crt','profile','legal','pe-closure',
-    'inventory','sbom','zip-extraction','defender-tree','defender-zip','privacy'
+    'inventory','sbom','payload-closure','zip-extraction','defender-tree','defender-zip','privacy'
 )
 if (@($internalPrerequisites | Where-Object { -not (Test-GateObservationPassed $_) }).Count -eq 0) {
     Set-GateObservation candidate-bytes-ready PASS 'all internal candidate byte prerequisites passed'
